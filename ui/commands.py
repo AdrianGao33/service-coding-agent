@@ -1,6 +1,17 @@
+"""
+ui/commands.py - 终端交互命令注册中心与 Rich 富文本格式化模块
+
+职责：
+1. 定义跨命令共享的 SessionState 状态类与 Command 命令抽象类
+2. 重写 Rich Markdown 渲染规则（修正标题居中问题）
+3. 将 Agent 产生的各类 Part 消息格式化为带颜色、缩进的 Rich 终端文本
+4. 提供 /new, /status, /api-detail, /help, /exit 等斜杠系统命令的处理器
+"""
+
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+# 从 Rich 库导入终端渲染的核心组件
 from rich.markdown import Heading, Markdown
 from rich.markup import escape
 from rich.padding import Padding
@@ -11,7 +22,7 @@ from .render import console, print_step, print_welcome_banner
 
 class LeftAlignedHeading(Heading):
     """
-    rich 默认把 Markdown 标题渲染成居中对齐，宽终端里看着像错位，覆盖成左对齐。
+    rich 默认把 Rich的Markdown 标题渲染成居中对齐，宽终端里看着像错位，覆盖成左对齐。
     """
     def __rich_console__(self, console, options):
         text = self.text
@@ -28,11 +39,11 @@ class SessionState:
     """
     跨命令共享的会话状态，主循环把它传给每个命令处理函数。
     """
-    history: list = field(default_factory=list)
-    input_tokens: int = 0
-    output_tokens: int = 0
+    history: list = field(default_factory=list)         # 完整的上下文消息历史列表
+    input_tokens: int = 0                               # 本次 Session 累计消耗的输入 Token 数
+    output_tokens: int = 0                              # 本次 Session 累计消耗的输出 Token 数
     model_name: str = ""
-    # 最近一轮 user input 触发的所有 model API 调用记录
+    # 最近一轮 user input 触发的所有 model API 调用记录   
     last_api_calls: list = field(default_factory=list)
 
 
@@ -74,22 +85,34 @@ def _format_part_line(part) -> Optional[str]:
     """
     # 内容行统一缩进 2 格，和图标（占 2 格：图标 + 空格）后的 role 名对齐
     kind = part.part_kind
+
+    # 1. 用户 Prompt
     if kind == "user-prompt":
         return f"[cyan]❯ user[/]\n  {_truncate(part.content)}"
+
+    # 2. 模型深度思考过程 (Thinking)
     if kind == "thinking":
         # thinking 整块 dim，弱化视觉权重；不截断，完整保留思考过程
         return f"[dim]✻ thinking[/]\n  [dim]{_full(part.content)}[/]"
+
+    # 3. 模型最终回复文本 (Text)    
     if kind == "text":
         content = (part.content or "").strip()
         if not content:
             return None
         # assistant 是用户最关心的最终回答，完整显示
         return f"[green]● assistant[/]\n  {_full(content)}"
+
+    # 4. 模型申请调用工具 (Tool Call)    
     if kind == "tool-call":
         # 命令、路径动辄上百字符，参数放宽到 500 字符再截断
         return f"[yellow]⏺ tool_call[/]\n  [yellow dim]{part.tool_name}({_truncate(part.args, 500)})[/]"
+
+    # 5. 工具返回结果 (Tool Return)
     if kind == "tool-return":
         return f"[magenta]✔ tool_return[/]\n  [magenta dim]{part.tool_name} -> {_truncate(part.content)}[/]"
+
+    # 6. 工具调用失败 (Tool Error)
     if kind == "retry-prompt":
         # 工具抛 ModelRetry 后，SDK 生成 retry-prompt 把错误反馈给模型
         return f"[yellow]✘ tool_retry[/]\n  [yellow dim]{part.tool_name} -> {_truncate(part.content)}[/]"
@@ -134,6 +157,7 @@ def print_agent_steps(new_messages) -> None:
                 continue
             print_part(part)
 
+# ================= 斜杠命令处理器 (Command Handlers) =================
 
 def cmd_exit(state: SessionState) -> bool:
     console.print("再见 👋")
