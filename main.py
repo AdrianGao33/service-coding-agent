@@ -7,8 +7,13 @@
 3. 驱动核心 Agent 运行并传递历史对话上下文
 4. 汇总与打印每一轮交互的 Token 消耗、API 日志与渲染输出
 """
+import asyncio #标准库类似于 threading 的异步协程库，支持 async/await 语法
 
 from prompt_toolkit import PromptSession #代替内置 input()，支持光标移动、历史输入等功能
+from pydantic_ai import Agent
+
+# pydantic_graph：PydanticAI 底层依靠图状态机驱动，End 代表图执行终点节点，是pydantic自己写的langchain，每个请求都变成了node，需要end节点来结束
+from pydantic_graph import End
 
 # 本地Agent文件夹 核心模块导入单例实例 agent、模型名称以及 API 调用的全局日志 Buffer
 from agent import agent, MODEL_NAME, api_call_log
@@ -18,7 +23,7 @@ from ui.commands import (
     COMMANDS,
     SessionState,
     console,
-    print_agent_steps,
+    print_part,
     print_divider,
     print_welcome_banner,
 )
@@ -28,7 +33,8 @@ prompt_session = PromptSession()
 
 def read_user_input():
     """
-    打印上横线并读一行用户输入；回车后再补一条下横线，让输入在滚动历史里保持上下边界。返回 None 表示用户希望退出（Ctrl-C / Ctrl-D）。
+    打印上下分割线，中间读取用户输入，返回字符串。
+    处理 Ctrl+C / Ctrl+D (EOFError, KeyboardInterrupt) 异常退出。
     """
     print_divider() #打印分割线
     try:
@@ -64,7 +70,7 @@ def handle_command(user_input, state):
 
 def apply_result(state, result):
     """
-    跑完一轮 Agent 后，把结果同步到 SessionState 并显示新增的中间过程。
+    状态同步：跑完一轮 Agent (无论经历了多少次内部节点迭代) 彻底运行结束后，把结果同步到 SessionState 
     """
     state.history = result.all_messages()
     usage = result.usage
@@ -72,8 +78,33 @@ def apply_result(state, result):
     state.output_tokens += usage.output_tokens
     state.last_api_calls = list(api_call_log)
     
-    # result.new_messages() 直接拿到这一轮新增的 message，不需要手动算偏移
-    print_agent_steps(result.new_messages())
+async def run_agent_loop(user_input, state):
+    """
+    核心白盒驱动引擎：
+    摒弃黑盒 run_sync()，使用 agent.iter() 逐节点 (Node) 驱动 Agent 图状态机流转。
+    实现“边思考、边调工具、边实时输出”的流式效果。
+    """
+    api_call_log.clear() # 每轮新对话发起前，清空全局 API 调用日志 Buffer
+ 
+    # 开启 Agent 图迭代器上下文，传入当前输入 + 全量历史上下文 (state.history)
+    async with agent.iter(user_input, message_history=state.history) as run: #iter是个异步的可迭代对象里面是多个节点（大模型请求和工具调用）
+        node = run.next_node
+        
+        # 只要当前节点不是终点 End，就一直在图状态机里往下走
+        while not isinstance(node, End):
+            node = await run.next(node)
+
+            if Agent.is_call_tools_node(node):          # 节点类型判断 A：如果是“模型决定调用工具”
+                for part in node.model_response.parts:
+                    print_part(part)                    # 实时将“正在准备调用的工具及其参数”渲染到终端
+
+            elif Agent.is_model_request_node(node):     # 节点类型判断 B：如果是“准备发起下一次模型请求”
+                for part in node.request.parts:
+                    if part.part_kind == "tool-return":
+                        print_part(part)                # 实时将“工具在本地执行返回的结果”渲染到终端
+
+    apply_result(state, run.result)         # 当循环遇到 End 节点退出后，run.result 会自动结算出最终的 AgentRunResult
+    console.print()
 
 
 def main():
@@ -95,14 +126,8 @@ def main():
         if action == "continue":
             continue
 
-        # 核心 Agent 循环：清空收集 buffer，跑一轮，把结果应用到 state
-        api_call_log.clear()
-
-        # - 同步调用 Agent，传入当前用户 Prompt 以及之前的全部对话历史上下文
-        result = agent.run_sync(user_input, message_history=state.history)
-
-        # - 将 Agent 的响应、新增 Token 和中间步骤同步到 state 并打印到终端
-        apply_result(state, result)
+        # 核心 Agent 循环：自己驱动节点流转，实时打印每一步
+        asyncio.run(run_agent_loop(user_input, state))
 
 
 if __name__ == "__main__":

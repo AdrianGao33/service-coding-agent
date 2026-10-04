@@ -1,7 +1,7 @@
 """
 Coding Agent 用到的三个工具：读文件、写文件、跑 shell 命令。
 Type hint + docstring 会被 Pydantic AI 自动解析成 JSON Schema，生成可调用的函数列表给大模型。
-报错不会被抛出，而是被捕获并返回给大模型，避免中断对话。
+报错不会被抛出，而是被捕获并return给大模型，避免中断对话。
 """
 import subprocess
 

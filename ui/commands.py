@@ -34,6 +34,7 @@ class LeftAlignedHeading(Heading):
 Markdown.elements["heading_open"] = LeftAlignedHeading
 
 
+# 在main.py会实例化一个用来做会话状态记录
 @dataclass
 class SessionState:
     """
@@ -45,14 +46,6 @@ class SessionState:
     model_name: str = ""
     # 最近一轮 user input 触发的所有 model API 调用记录   
     last_api_calls: list = field(default_factory=list)
-
-
-@dataclass
-class Command:
-    name: str
-    description: str
-    # handler 返回 False 表示主循环应当退出
-    handler: Callable[["SessionState"], bool]
 
 
 def print_divider() -> None:
@@ -158,6 +151,14 @@ def print_agent_steps(new_messages) -> None:
             print_part(part)
 
 # ================= 斜杠命令处理器 (Command Handlers) =================
+
+# Command 命令抽象类，所有斜杠命令都要注册成 Command 对象
+@dataclass
+class Command:
+    name: str
+    description: str
+    # handler 返回 False 表示主循环应当退出
+    handler: Callable[["SessionState"], bool]
 
 def cmd_exit(state: SessionState) -> bool:
     console.print("再见 👋")
