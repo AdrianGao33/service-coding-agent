@@ -127,8 +127,17 @@ def main():
             continue
 
         # 核心 Agent 循环：自己驱动节点流转，实时打印每一步
-        asyncio.run(run_agent_loop(user_input, state))
+        try:
+            asyncio.run(run_agent_loop(user_input, state))
+            
+        except KeyboardInterrupt:
+            # 当大模型响应过慢或工具运行卡住时，用户按下 Ctrl+C 仅取消当前这轮运行，
+            # 阻止 Python 进程退出，友好提示后恢复到输入提示符 `❯`
+            console.print("\n[bold yellow]已中断[/]\n")
 
+        except Exception as e:
+            # 其他意料之外的异常，打印错误日志后退出
+            console.print(f"\n[bold red]✗ {type(e).__name__}: {e}[/]\n")
 
 if __name__ == "__main__":
     main()
