@@ -1,15 +1,22 @@
 """
-挂在 Agent 上的 hooks，用来抓每次 model API 调用的元数据。
+Agent 生命周期钩子与切面拦截器 (Hooks & Middleware System)
 
-工作流：
-1. 主循环在每轮 run_agent_loop 运行前清空全局 api_call_log 数组。
-2. 每次与大模型交互时，通过 Hook 自动拦截并在 api_call_log 填充一次调用的元数据。
-3. 跑完后快照到 SessionState 里，供 /api-detail 斜杠命令展示给用户。
-4. 捕获模型层 HTTP/网络波动并进行指数退避重试。
-5. 拦截工具执行时的未捕获异常，将其转化为提示文本供大模型自我纠错。
+职责涵盖四大核心领域：
+1. 监控与元数据审计 (Audit & Metrics):
+   在 model 请求前后截获并记录 Token 消耗、消息条数、调用工具列表及响应 finish_reason，
+   全量缓存至全局 api_call_log 供前端/控制台渲染展示。
 
-创建了一个ApiCall的类，用这个类创建了一个api_call_log的全局变量，来记录每次调用的元数据
-两个hook中间件，在call前后分别记录请求和响应的元数据存到这个变量里
+2. API 网络容错与指数退避重试 (Resilience & Retry):
+   利用 @hooks.on.model_request 拦截底层 HTTP 5xx 服务器错误及网络超时异常，
+   自动进行 2^n 秒的指数退避重试，保证高可用性。
+
+3. 工具执行前置权限拦截 (Permission Gate Control):
+   利用 @hooks.on.tool_execute 拦截每一次工具调用。结合 permissions 模块进行
+   计算决策与终端交互弹窗，决定放行、记住白名单或安全拒绝。
+
+4. 工具未捕获异常兜底 (Fallback & Graceful Error Handling):
+   利用 @hooks.on.tool_execute_error 捕获本地 Python 工具运行时的崩溃异常，
+   将其转化为标准的错误响应文本吞下并降级还给大模型，避免主进程崩溃。
 """
 import asyncio
 from dataclasses import dataclass, field
@@ -19,10 +26,10 @@ from typing import Any
 from pydantic_ai.capabilities import Hooks
 from pydantic_ai.exceptions import ModelHTTPError, ModelAPIError
 
+import permissions
 from ui.render import console
 
 MAX_RETRIES = 3
-
 
 @dataclass
 class ApiCall:
@@ -32,9 +39,8 @@ class ApiCall:
     # request 侧
     model: str 
     messages_count: int #发送给模型的历史消息条数+当前消息条数
-    # 这次发送给模型的 messages 中最后一条消息的最后一个 part
-    last_part: Any
-    tools: list 
+    last_part: Any # 这次发送给模型的 messages 中最后一条消息的最后一个 part
+    tools: list # 这次调用中使用的工具列表
 
     # response 侧（after hook 填充）
     finish_reason: str = ""
@@ -47,6 +53,10 @@ class ApiCall:
 api_call_log: list[ApiCall] = []
 
 hooks = Hooks()
+
+# ------------------------------------------------------------------------------
+# 1. API 统计与元数据追踪 Hooks
+# ------------------------------------------------------------------------------
 
 #ctx是单次用户提问的上下文对象（这里可以多轮次call llm api)，request_context，response是单轮次api请求上下文对象
 @hooks.on.before_model_request
@@ -83,7 +93,9 @@ async def _record_response(ctx, request_context, response):
         call.output_tokens = response.usage.output_tokens
     return response
 
-# ---------- API 请求重试 ----------
+# ------------------------------------------------------------------------------
+# 2. API 请求网络指数退避重试
+# ------------------------------------------------------------------------------
 
 @hooks.on.model_request
 async def _retry_on_error(ctx, *, request_context, handler):
@@ -120,8 +132,45 @@ async def _retry_on_error(ctx, *, request_context, handler):
             )
             await asyncio.sleep(wait)
 
+# ------------------------------------------------------------------------------
+# 3. 工具执行前置权限拦截网 
+# ------------------------------------------------------------------------------
 
-# ---------- 工具执行异常兜底 ----------
+@hooks.on.tool_execute
+async def _check_permission(ctx, *, call, tool_def, args, handler):
+    """
+    【工具切面钩子】在任意 Python 本地工具函数真正执行之前触发。
+
+    参数说明:
+        call: 包含了当前工具调用信息的对象 (如 call.tool_name)
+        tool_def: 工具的 Schema 定义对象
+        args (dict): 大模型解析出来的工具输入参数
+        handler (Callable): 真正执行底层 Python 工具的回调句柄！只有调用 handler(args) 才算真正执行工具
+
+    返回说明:
+        返回工具的实际执行结果，或者返回拒绝说明字符串给大模型。
+    """
+    decision = permissions.compute_decision(call.tool_name, args)
+    if decision == "allow":
+        # 放行，handler(args) 才是真正执行工具的那一步
+        return await handler(args)
+
+    # decision == "ask"，弹审批让用户决定
+    choice = await permissions.prompt_approval(call.tool_name, args)
+    if choice == "once":
+        return await handler(args)
+    if choice == "always":
+        # 记进会话白名单，本会话内这个工具不再询问
+        permissions.state.session_allowed.add(call.tool_name) # 动态将工具名注入到当前进程的状态白名单中
+        return await handler(args)
+
+    # 拒绝：不执行工具，把拒绝原因回填给模型，让它停下来等用户发话，而不是自作主张绕过去
+    return f"用户拒绝了对 {call.tool_name} 的调用，这次调用没有执行。请停下手上的事，等用户告诉你接下来该怎么做。"
+
+
+# ------------------------------------------------------------------------------
+# 4. 工具未捕获异常兜底 (Fallback)
+# ------------------------------------------------------------------------------
 
 @hooks.on.tool_execute_error
 async def _handle_tool_error(ctx, *, call, tool_def, args, error):

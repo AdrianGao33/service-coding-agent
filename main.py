@@ -2,18 +2,18 @@
 入口、主控循环 (REPL)
 
 职责：
-1. 维护终端输入 (PromptSession)
-2. 解析斜杠命令 (Slash Commands, 如 /help, /clear)
-3. 驱动核心 Agent 运行并传递历史对话上下文
-4. 汇总与打印每一轮交互的 Token 消耗、API 日志与渲染输出
+1. UI 事件驱动：初始化 Repl 常驻输入界面，监听用户键盘提交事件。
+2. 斜杠命令拦截：优先解析 /help、/resume 等控制命令，隔离系统指令与模型对话。
+3. 白盒图引擎驱动：利用 agent.iter() 逐节点 (Node) 驱动 PydanticAI 状态机，实现实时终端渲染。
+4. 状态结算与持久化：每轮对话结束后，归集 Token 消耗、API 日志并写回磁盘 session 文件。
 """
 import asyncio #标准库类似于 threading 的异步协程库，支持 async/await 语法
 
-from prompt_toolkit import PromptSession #代替内置 input()，支持光标移动、历史输入等功能
 from pydantic_ai import Agent
-
 # pydantic_graph：PydanticAI 底层依靠图状态机驱动，End 代表图执行终点节点，是pydantic自己写的langchain，每个请求都变成了node，需要end节点来结束
 from pydantic_graph import End
+
+import session
 
 # 本地Agent文件夹 核心模块导入单例实例 agent、模型名称以及 API 调用的全局日志 Buffer
 from agent import agent, MODEL_NAME, api_call_log
@@ -24,48 +24,31 @@ from ui.commands import (
     SessionState,
     console,
     print_part,
-    print_divider,
     print_welcome_banner,
 )
 
-prompt_session = PromptSession()
+# 导入手搓的终端常驻交互式输入组件 Repl
+from ui.input_ui import Repl
 
-
-def read_user_input():
-    """
-    打印上下分割线，中间读取用户输入，返回字符串。
-    处理 Ctrl+C / Ctrl+D (EOFError, KeyboardInterrupt) 异常退出。
-    """
-    print_divider() #打印分割线
-    try:
-        user_input = prompt_session.prompt("❯ ").strip() #拿到用户输入
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return None
-    print_divider() #打印分割线
-    return user_input 
-
-
-def handle_command(user_input, state): 
+async def handle_command(user_input, state):
     """
     处理以 / 开头的命令。
-    返回 'pass'：不是命令，主循环继续往下走交给 Agent
-    返回 'continue'：命令已处理，主循环跳到下一轮
-    返回 'break'：命令要求退出主循环
+    返回 'pass'：不是命令，交给 Agent；
+    返回 'continue'：命令已处理，进入下一轮；
+    返回 'break'：命令要求退出程序。
     """
     if not user_input.startswith("/"):
         return "pass"
-
-    # 解析命令名并查找对应的 Command 对象
     cmd_name = user_input[1:].split()[0]
     command = COMMANDS.get(cmd_name)
-
     if command is None:
         console.print(f"未知命令：/{cmd_name}，输入 /help 查看可用命令\n")
         return "continue"
-
-    # 执行命令的 handler，传入当前 SessionState
-    return "continue" if command.handler(state) else "break"
+    result = command.handler(state)
+    # 个别命令（如 /resume）要弹交互式列表，是异步的，需要 await
+    if asyncio.iscoroutine(result):
+        result = await result
+    return "continue" if result else "break"
 
 
 def apply_result(state, result):
@@ -77,6 +60,8 @@ def apply_result(state, result):
     state.input_tokens += usage.input_tokens
     state.output_tokens += usage.output_tokens
     state.last_api_calls = list(api_call_log)
+    # 把本轮新增的消息追加到会话文件
+    session.append_messages(state.session_id, result.new_messages())
     
 async def run_agent_loop(user_input, state):
     """
@@ -100,44 +85,46 @@ async def run_agent_loop(user_input, state):
 
             elif Agent.is_model_request_node(node):     # 节点类型判断 B：如果是“准备发起下一次模型请求”
                 for part in node.request.parts:
-                    if part.part_kind == "tool-return":
+                    if part.part_kind in ("tool-return", "retry-prompt"):
                         print_part(part)                # 实时将“工具在本地执行返回的结果”渲染到终端
 
     apply_result(state, run.result)         # 当循环遇到 End 节点退出后，run.result 会自动结算出最终的 AgentRunResult
-    console.print()
 
 
-def main():
-    state = SessionState(model_name=MODEL_NAME) # 初始化会话状态
-    print_welcome_banner("Coding Agent")
+async def main():
+    state = SessionState(
+        model_name=MODEL_NAME,
+        session_id=session.new_session_id(),
+    )
+    print_welcome_banner("my-claude-code")
 
-    while True:
-        # 读用户输入
-        user_input = read_user_input()
-        if user_input is None:
-            break
-        if not user_input:
-            continue
+    # 常驻输入区：输入框整个会话期间不消失
+    repl = Repl(state)
 
-        # 处理 / 开头的命令
-        action = handle_command(user_input, state)
+    async def on_submit(user_input):
+        # 每次回车提交一行输入，都走这里
+        # 先处理 / 开头的命令
+
+        # Step 1: 优先拦截并处理斜杠命令
+        action = await handle_command(user_input, state)
         if action == "break":
-            break
+            # 命令要求退出，结束常驻输入区
+            repl.exit()
+            return
         if action == "continue":
-            continue
+            return
 
-        # 核心 Agent 循环：自己驱动节点流转，实时打印每一步
-        try:
-            asyncio.run(run_agent_loop(user_input, state))
-            
-        except KeyboardInterrupt:
-            # 当大模型响应过慢或工具运行卡住时，用户按下 Ctrl+C 仅取消当前这轮运行，
-            # 阻止 Python 进程退出，友好提示后恢复到输入提示符 `❯`
-            console.print("\n[bold yellow]已中断[/]\n")
+        # Step 2: 切换 Repl UI 状态为 working (显示思考中状态指示器)
+        repl.start_working()
 
-        except Exception as e:
-            # 其他意料之外的异常，打印错误日志后退出
-            console.print(f"\n[bold red]✗ {type(e).__name__}: {e}[/]\n")
+        # Step 3: 进入白盒图循环，真正驱动 Agent 执行任务
+        await run_agent_loop(user_input, state)
+
+    # 启动 Repl 事件循环，等待用户敲击回车唤起 on_submit
+    await repl.run(on_submit)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, EOFError):
+        pass # 优雅响应 Ctrl+C 或 Ctrl+D 退出

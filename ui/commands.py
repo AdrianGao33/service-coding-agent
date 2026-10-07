@@ -5,18 +5,21 @@ ui/commands.py - 终端交互命令注册中心与 Rich 富文本格式化模块
 1. 定义跨命令共享的 SessionState 状态类与 Command 命令抽象类
 2. 重写 Rich Markdown 渲染规则（修正标题居中问题）
 3. 将 Agent 产生的各类 Part 消息格式化为带颜色、缩进的 Rich 终端文本
-4. 提供 /new, /status, /api-detail, /help, /exit 等斜杠系统命令的处理器
+4. 提供 /new, /status, /api-detail, /help, /exit，/resume 等斜杠系统命令的处理器
 """
 
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 # 从 Rich 库导入终端渲染的核心组件
+import questionary #cmdline 交互式选择库，支持上下键选择、回车确认
 from rich.markdown import Heading, Markdown
 from rich.markup import escape
 from rich.padding import Padding
 from rich.rule import Rule
 
+import permissions
+import session
 from .render import console, print_step, print_welcome_banner
 
 
@@ -44,6 +47,8 @@ class SessionState:
     input_tokens: int = 0                               # 本次 Session 累计消耗的输入 Token 数
     output_tokens: int = 0                              # 本次 Session 累计消耗的输出 Token 数
     model_name: str = ""
+    # 当前会话 ID，决定对话历史写入哪个 jsonl 文件
+    session_id: str = ""
     # 最近一轮 user input 触发的所有 model API 调用记录   
     last_api_calls: list = field(default_factory=list)
 
@@ -70,7 +75,7 @@ def _full(text) -> str:
     """
     return escape(str(text).strip())
 
-
+# 每个role分配不一样的打印格式
 def _format_part_line(part) -> Optional[str]:
     """
     把一条消息里的单个 part 格式化为带 Rich markup 的字符串。
@@ -111,7 +116,7 @@ def _format_part_line(part) -> Optional[str]:
         return f"[yellow]✘ tool_retry[/]\n  [yellow dim]{part.tool_name} -> {_truncate(part.content)}[/]"
     return None
 
-
+# 特殊情况：llm回复的是Markdown的打印格式
 def print_assistant_markdown(content: str) -> None:
     """
     模型的回复天然是 Markdown 格式，整块渲染出来，而不是打印原始文本。
@@ -120,7 +125,7 @@ def print_assistant_markdown(content: str) -> None:
     # Markdown 是块级渲染对象，没法跟在行内前缀后面，所以另起一行渲染；左缩进 2 格和 role 名对齐
     console.print(Padding(Markdown(content), (0, 0, 0, 2)))
 
-
+# _format_part_line判断转换过后，打印
 def print_part(part) -> None:
     """
     渲染单个消息 part：assistant 文本走 Markdown 块渲染，其余 part 是单行文本。
@@ -138,7 +143,7 @@ def print_part(part) -> None:
         # body 形如 "  [markup]…"，去掉字面前导 2 空格，交给 print_step 用 Padding 缩进（折行续行也保持缩进）
         print_step(label, body[2:])
 
-
+# 多个print_part循环打印
 def print_agent_steps(new_messages) -> None:
     """
     主循环里调用：显示这一轮 Agent 新增的中间过程（thinking、文本、工具调用、工具返回）。
@@ -181,9 +186,74 @@ def cmd_new(state: SessionState) -> bool:
     state.input_tokens = 0
     state.output_tokens = 0
     state.last_api_calls.clear()
+    state.session_id = session.new_session_id()
+    permissions.state.session_allowed.clear()
     console.print("已开启新会话\n")
     return True
 
+def _summary_line(mtime, prompt: str) -> str:
+    """
+    拼一条会话列表的展示文本（菜单行展示用）：修改时间 + 首条用户输入摘要。
+    格式：[月份-日期 小时:分钟] + 压缩清洗后的首条用户 Prompt 摘要
+    """
+    prompt = " ".join(str(prompt).split())
+    if len(prompt) > 50:
+        prompt = prompt[:50] + "..."
+    return f"{mtime:%m-%d %H:%M}  {prompt}"
+
+
+def cmd_resume(state: SessionState) -> bool:
+    """
+    list当前项目的历史会话，选中后恢复对话历史，提供交互式菜单供用户选择并恢复指定上下文。
+    返回:
+        bool: True 表示指令已消费处理完毕，告知主循环可以继续等待下一次用户输入。
+    """
+
+    # 获取所有会话文件，按修改时间从新到旧返回 (session_id, 修改时间, 首条用户输入) 列表
+    sessions = session.list_sessions()
+    if not sessions:
+        console.print("(当前项目还没有历史会话)\n")
+        return True
+    
+    # 生成 questionary 的选择列表，每行显示修改时间 + 首条用户输入摘要
+    choices = [
+        questionary.Choice(title=_summary_line(mtime, prompt), value=sid)
+        for sid, mtime, prompt in sessions
+    ]
+    # 交互式选择菜单，用户上下键移动，回车确认
+    selected = questionary.select(
+        "选择要恢复的会话（上下键移动，回车确认）：", choices=choices
+    ).ask()
+    
+    # 用户按 Ctrl+C 取消选择
+    if selected is None:
+        return True
+
+    # 还原对话历史，并把会话 ID 切换成选中的旧会话，后续消息继续追加到同一个文件
+    state.history = session.load_history(selected)
+    state.session_id = selected
+
+    # 权限白名单是会话级的，切换会话后清空
+    permissions.state.session_allowed.clear()
+
+    # jsonl 里每条模型回复都带 usage，把会话的 token 用量累加回来
+    state.input_tokens = sum(
+        m.usage.input_tokens for m in state.history if m.kind == "response"
+    )
+    state.output_tokens = sum(
+        m.usage.output_tokens for m in state.history if m.kind == "response"
+    )
+    # 最近一轮的 API 调用记录只在进程内有效，没法恢复，清空
+    state.last_api_calls.clear()
+
+    # 把恢复的对话回放到屏幕上
+    console.print(f"\n已恢复会话 {selected[:8]}，共 {len(state.history)} 条消息：\n")
+    for msg in state.history:
+        for part in msg.parts:
+            # 回放和实时输出共用同一套 part 渲染逻辑
+            print_part(part)
+    console.print()
+    return True
 
 def cmd_status(state: SessionState) -> bool:
     console.print(f"模型：           {state.model_name}")
@@ -223,6 +293,7 @@ def cmd_api_detail(state: SessionState) -> bool:
 
 COMMANDS = {
     "new": Command("new", "开启新会话", cmd_new),
+    "resume": Command("resume", "恢复历史会话", cmd_resume),
     "status": Command("status", "显示当前会话状态", cmd_status),
     "api-detail": Command("api-detail", "显示最近一轮 model API 调用详情", cmd_api_detail),
     "help": Command("help", "显示可用命令", cmd_help),

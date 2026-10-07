@@ -4,17 +4,25 @@ Coding Agent 用到的三个工具：读文件、写文件、跑 shell 命令。
 1. Type hint（类型提示） + docstring（函数文档注释）会被 Pydantic AI 自动提取解析成 JSON Schema，
    作为 Tools 声明发送给大模型 API，大模型据此感知工具的名称、功能及入参格式。
 
-2. 错误治理体系：
-   - ModelRetry 意料之内的异常：抛出 ModelRetry，触发 PydanticAI 内部重试机制，提示模型修改参数；
-   - return 不可纠正错误 / 过程结果（二进制文件、Shell 命令报错/超时）：直接 return 错误文本，作为正常上下文传给模型分析；
-   - raise 意料之外的未捕获异常：由 hooks 里的 on_tool_execute_error 进行最外层防护兜底。
-   # 核心区别：ModelRetry 是“入参有误打回强行纠错”（计入 retry 上限并强制改参重调），而 return 是“客观结果交卷反馈”（作为正常上下文供大模型自主决策下一步）。
+2. 三层错误治理体系：
+   - 分级 1：raise ModelRetry("提示...") —— 针对入参可修改救活的错误（如路径拼错、权限不足）。
+     拦截后由 PydanticAI 框架全自动打回给大模型在同一轮次重试修正。
+   - 分级 2：return "错误/日志信息..." —— 针对客观报错或调试上下文（如 Shell 报错、超时、二进制文件）。
+     作为正常的 ToolReturnPart 供大模型读取日志并自主决策下一步 Debug 动作。
+   - 分级 3：Global Hooks 防线 —— 由 @hooks.on_tool_execute_error 捕获底层未知严重崩溃，保护进程。
+
+3. 工具安全与权限治理 (Tool Permissions & Audit)：
+   - 配合 permissions 模块，利用“注册表模式 (Registry Pattern)”在工具执行前注入高危命令匹配自检规则。
 """
+# re 是 Python 正则表达式库，这里用来精准扫描命令文本；通过 \b（单词边界）约束，
+# 能严格区分独立的危险命令（如单独的 rm），避免误伤包含相同字母的正常单词（如 terminal 或 format）。
+import re 
 import subprocess
 
 # 导入 PydanticAI 专门用于告知大模型“参数有误，请修改后重试”的特化异常类
 from pydantic_ai.exceptions import ModelRetry
 
+import permissions
 
 def read_file(path: str) -> str:
     """
@@ -70,6 +78,32 @@ def run_command(command: str) -> str:
     except OSError as e:
         return f"[错误] 无法执行命令 ({e})"
 
+
+# 高危命令的特征：删除文件、提权、直写磁盘
+DANGEROUS_PATTERNS = [
+    r"\brm\b",          # 删除文件/目录指令 (如 rm -rf)
+    r"\bsudo\b",        # 提权执行指令
+    r"\bdd\b",          # 底层磁盘/块设备直接写指令
+    r"\bmkfs\w*\b",     # 格式化文件系统指令 (如 mkfs, mkfs.ext4)
+]
+
+
+def run_command_self_check(args: dict):
+    """
+    run_command 的权限自检：扫一遍命令字符串，命中高危特征就要求审批。
+    args (dict): 大模型传入工具的入参字典，格式为 {"command": "..."}
+
+    """
+    command = args.get("command", "")
+    if any(re.search(pattern, command) for pattern in DANGEROUS_PATTERNS):
+        return "ask"
+    # 没命中高危特征，交给通用规则决定
+    return None
+
+#【注册表模式 (Registry Pattern)】
+# 将 run_command_self_check 函数作为回调引用，注册到 permissions 模块的 "run_command" key下。
+# 当权限引擎校验 run_command 工具时，会自动查表并触发此回调函数。
+permissions.register_self_check("run_command", run_command_self_check)
 
 # Pydantic AI 支持 tools=[plain_function]，从函数签名 + docstring 自动生成 JSON Schema
 TOOLS = [read_file, write_file, run_command]
