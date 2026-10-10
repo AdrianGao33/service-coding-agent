@@ -44,7 +44,7 @@ async def handle_command(user_input, state) -> str:
     if command is None:
         console.print(f"未知命令：/{cmd_name}，输入 /help 查看可用命令\n")
         return "continue"
-    result = command.handler(state)
+    result = command.handler(state) #这边才执行
     # 个别命令（如 /resume）要弹交互式列表，是异步函数，会返回一个coroutine，跑起来前面需要加 await
     if asyncio.iscoroutine(result): 
         result = await result
