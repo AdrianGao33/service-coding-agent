@@ -1,10 +1,10 @@
 """
-会话持久化模块：把对话历史写成 JSONL 文件，支持按项目隔离存储、追加写入、历史扫描与恢复会话。
+会话持久化模块：把对话历史存为本地 JSONL 文件。
 
-设计模式：
-1. 采用 JSONL (JSON Lines) 格式实现 Append-only 追加写入，保证崩塌安全与高并发性能。
-2. 依据当前工作目录 (CWD) 进行 Hash/Sanitize 隔离，确保不同项目间的会话上下文独立。
-3. 利用 PydanticAI 的 ModelMessagesTypeAdapter 实现强类型的消息序列化与反序列化。
+设计核心：
+1. 追加写入 (Append-only)：一行记录一条消息，防崩溃且写入极快。
+2. 项目隔离：根据当前终端工作路径 (CWD) 自动创建独立文件夹，不同项目互不干扰。
+3. 强类型转换：借用 PydanticAI 工具，在“Python 消息对象”与“JSON 文本”之间无缝切换。
 """
 import json #json.dumps转换: dict -> json / json.loads转换: json -> dict
 import re
@@ -46,14 +46,14 @@ def new_session_id() -> str:
 
 def session_file(session_id: str) -> Path:
     """
-    根据会话 ID 拼接出其在本地磁盘上的完整 JSONL 文件路径。
+    拼接出具体某次会话的 .jsonl 文件完整路径
     """
     return project_dir() / f"{session_id}.jsonl"
 
 
 def append_messages(session_id: str, messages) -> None:
     """
-    把本轮新增的消息追加到会话文件末尾，一行一条。
+    追加消息：把本轮产生的增量消息追加写到文件末尾（一行一条 JSON）
     """
     path = session_file(session_id)
     # 防御性创建：确保项目的存储子目录存在，若不存在则递归创建
@@ -69,7 +69,7 @@ def append_messages(session_id: str, messages) -> None:
 
 def load_history(session_id: str) -> list:
     """
-    读取整个会话文件，把每行 JSON 还原成 SDK 的消息对象列表。
+    恢复会话：读取整份 .jsonl 文件，批量反序列化为 Agent 能直接理解的消息列表
     """
     # 一次性读取文件的所有行并按行切分
     lines = session_file(session_id).read_text(encoding="utf-8").splitlines()
@@ -79,7 +79,6 @@ def load_history(session_id: str) -> list:
         [json.loads(line) for line in lines]
     )
 
-# 提取会话总结（为list_sessions提供菜单行展示文本）
 def first_prompt(path: Path) -> str:
     """
     只读文件第一行，提取首条用户输入作为这个会话的摘要。

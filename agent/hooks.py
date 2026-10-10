@@ -1,22 +1,14 @@
 """
 Agent 生命周期钩子与切面拦截器 (Hooks & Middleware System)
 
-职责涵盖四大核心领域：
-1. 监控与元数据审计 (Audit & Metrics):
-   在 model 请求前后截获并记录 Token 消耗、消息条数、调用工具列表及响应 finish_reason，
-   全量缓存至全局 api_call_log 供前端/控制台渲染展示。
+四大核心职能：
+1. 元数据审计：在模型请求前后，记录 Token 消耗、工具列表与 finish_reason，打入全局 api_call_log
 
-2. API 网络容错与指数退避重试 (Resilience & Retry):
-   利用 @hooks.on.model_request 拦截底层 HTTP 5xx 服务器错误及网络超时异常，
-   自动进行 2^n 秒的指数退避重试，保证高可用性。
+2. 网络容错重试：遇到 HTTP 5xx 或网络超时，以 2^n 秒指数退避自动重试（最多 3 次）
 
-3. 工具执行前置权限拦截 (Permission Gate Control):
-   利用 @hooks.on.tool_execute 拦截每一次工具调用。结合 permissions 模块进行
-   计算决策与终端交互弹窗，决定放行、记住白名单或安全拒绝。
+3. 工具权限拦截：工具执行前，调用 permissions 模块弹窗审批，决定放行或拒绝
 
-4. 工具未捕获异常兜底 (Fallback & Graceful Error Handling):
-   利用 @hooks.on.tool_execute_error 捕获本地 Python 工具运行时的崩溃异常，
-   将其转化为标准的错误响应文本吞下并降级还给大模型，避免主进程崩溃。
+4. 工具崩溃兜底：捕获本地 Python 工具运行异常，降级为错误字符串还给大模型，防主进程崩塌
 """
 import asyncio
 from dataclasses import dataclass, field
@@ -34,22 +26,22 @@ MAX_RETRIES = 3
 @dataclass
 class ApiCall:
     """
-    一次 model API 调用的元数据。before_model_request 创建并填充上半部分，after_model_request 填充下半部分。
+    单次 API 调用的元数据结构：before 钩子填上半段（请求侧），after 钩子填下半段（响应侧）
     """
-    # request 侧
+    # 请求侧元数据
     model: str 
-    messages_count: int #发送给模型的历史消息条数+当前消息条数
-    last_part: Any # 这次发送给模型的 messages 中最后一条消息的最后一个 part
-    tools: list # 这次调用中使用的工具列表
+    messages_count: int # 发送给模型的历史+当前消息总条数
+    last_part: Any      # 发送消息中最后一条的最后一个 part
+    tools: list         # 本次允许调用的工具清单
 
-    # response 侧（after hook 填充）
+    # 响应侧元数据（after 钩子回填）
     finish_reason: str = ""
     parts_kinds: list = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
 
 
-# 模块级全局共享单例列表，用来缓存当前这轮对话产生的 API 调用记录
+# 全局单例日志 Buffer：缓存当前轮次产生的 API 调用记录，供 UI 界面渲染
 api_call_log: list[ApiCall] = []
 
 hooks = Hooks()
@@ -58,11 +50,12 @@ hooks = Hooks()
 # 1. API 统计与元数据追踪 Hooks
 # ------------------------------------------------------------------------------
 
-#ctx是单次用户提问的上下文对象（这里可以多轮次call llm api)，request_context，response是单轮次api请求上下文对象
+# ctx是单次用户提问的上下文对象（这里可以多轮次call llm api)，request_context，response是单轮次api请求上下文对象
+# request_context：准备塞给大模型的数据（包含 Prompt、历史消息、工具列表等）
 @hooks.on.before_model_request
 async def _record_request(ctx, request_context):
     """
-    创建+填上半段：每次发起 model 调用之前，创建一条 ApiCall 记录。
+    请求前钩子：创建 ApiCall 记录并填充请求侧元数据（模型名、消息数、工具列表）
     """
     msgs = list(request_context.messages)
     last_part = msgs[-1].parts[-1] if msgs and msgs[-1].parts else None
@@ -79,11 +72,11 @@ async def _record_request(ctx, request_context):
     ))
     return request_context
 
-
+# response：大模型 API 刚返回的原始结果（包含生成文本、Token 消耗、finish_reason）。
 @hooks.on.after_model_request
 async def _record_response(ctx, request_context, response):
     """
-    填充下半段：每次 model 调用返回后，填充上面这条 ApiCall 的 response 字段。
+    响应后钩子：回填最新 ApiCall 记录的响应元数据（Token 消耗、结束原因等）
     """
     if api_call_log:
         call = api_call_log[-1]
@@ -97,12 +90,11 @@ async def _record_response(ctx, request_context, response):
 # 2. API 请求网络指数退避重试
 # ------------------------------------------------------------------------------
 
+# handler：包裹模型请求的底层网络调用句柄。
 @hooks.on.model_request
 async def _retry_on_error(ctx, *, request_context, handler):
     """
-    包裹 model 请求，遇到可重试错误时自动指数退避重试。
-
-    重试在 wrap 内部完成，对话历史和 before/after hooks 不受影响。
+    请求包裹钩子：拦截 HTTP 5xx 与网络超时异常，按 1s -> 2s -> 4s 指数退避重试
     """
     for attempt in range(MAX_RETRIES + 1):
         try:
@@ -142,7 +134,7 @@ async def _check_permission(ctx, *, call, tool_def, args, handler):
     【工具切面钩子】在任意 Python 本地工具函数真正执行之前触发。
 
     参数说明:
-        call: 包含了当前工具调用信息的对象 (如 call.tool_name)
+        call: 包含了当前工具调用信息的对象 (如 call.tool_name：pydantic转换从tools那边传过来的工具名称)
         tool_def: 工具的 Schema 定义对象
         args (dict): 大模型解析出来的工具输入参数
         handler (Callable): 真正执行底层 Python 工具的回调句柄！只有调用 handler(args) 才算真正执行工具
@@ -172,6 +164,7 @@ async def _check_permission(ctx, *, call, tool_def, args, handler):
 # 4. 工具未捕获异常兜底 (Fallback)
 # ------------------------------------------------------------------------------
 
+# error：本地 Python 工具代码抛出的原始异常对象（如 FileNotFoundError）。
 @hooks.on.tool_execute_error
 async def _handle_tool_error(ctx, *, call, tool_def, args, error):
     """

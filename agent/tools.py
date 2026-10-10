@@ -1,25 +1,23 @@
 """
 Coding Agent 用到的三个工具：读文件、写文件、跑 shell 命令。
 
-1. Type hint（类型提示） + docstring（函数文档注释）会被 Pydantic AI 自动提取解析成 JSON Schema，
-   作为 Tools 声明发送给大模型 API，大模型据此感知工具的名称、功能及入参格式。
+核心设计：
+1. 声明即 Schema：函数的类型提示 (Type hint) + 文档注释 (docstring) 会被 PydanticAI
+   自动打包成 JSON Schema 发给大模型，大模型据此感知工具名称、功能与入参格式。
 
-2. 三层错误治理体系：
-   - 分级 1：raise ModelRetry("提示...") —— 针对入参可修改救活的错误（如路径拼错、权限不足）。
-     拦截后由 PydanticAI 框架全自动打回给大模型在同一轮次重试修正。
-   - 分级 2：return "错误/日志信息..." —— 针对客观报错或调试上下文（如 Shell 报错、超时、二进制文件）。
-     作为正常的 ToolReturnPart 供大模型读取日志并自主决策下一步 Debug 动作。
-   - 分级 3：Global Hooks 防线 —— 由 @hooks.on_tool_execute_error 捕获底层未知严重崩溃，保护进程。
+2. 错误分级治理：
+   - raise ModelRetry模型可修正错误：抛出 raise ModelRetry(...) 触发框架让大模型自我纠错重试；
+   - return执行客观报错：返回 "错误/日志..." 字符串，作为工具结果交由大模型看日志 Debug；
+   - 严重崩溃：依靠全局 Hook 捕获底层未知异常。   
 
-3. 工具安全与权限治理 (Tool Permissions & Audit)：
-   - 配合 permissions 模块，利用“注册表模式 (Registry Pattern)”在工具执行前注入高危命令匹配自检规则。
+3. 安全拦截：搭配 permissions 模块注册高危特征检查（如 rm、sudo），执行前触发审批。
 """
 # re 是 Python 正则表达式库，这里用来精准扫描命令文本；通过 \b（单词边界）约束，
 # 能严格区分独立的危险命令（如单独的 rm），避免误伤包含相同字母的正常单词（如 terminal 或 format）。
 import re 
 import subprocess
 
-# 导入 PydanticAI 专门用于告知大模型“参数有误，请修改后重试”的特化异常类
+# PydanticAI 专有异常：抛出后框架会自动生成 retry-prompt 塞回给大模型，要求其修正参数重试
 from pydantic_ai.exceptions import ModelRetry
 
 import permissions
@@ -64,9 +62,9 @@ def run_command(command: str) -> str:
         result = subprocess.run(
             command, 
             shell=True,           # 允许通过 Shell 解释执行完整命令
-            capture_output=True,  # 截获 stdout 和 stderr，供程序读取而非直接打屏
-            text=True,            # 将输出自动转为 str 类型 (非 bytes)
-            errors="replace",     # 遇到非法编码字符时用 ? 替换，不抛出 UnicodeDecodeError
+            capture_output=True,  # 截获标准输出和标准错误，供程序读取而非打到屏幕
+            text=True,            # 输出自动转为字符串，非 bytes
+            errors="replace",     # 遇到特殊编码字符用 ? 替换，防止报错崩溃
             timeout=10,           # 设置 10 秒超时拦截，防止死循环命令卡死后台
         )
         output = result.stdout
@@ -90,9 +88,7 @@ DANGEROUS_PATTERNS = [
 
 def run_command_self_check(args: dict):
     """
-    run_command 的权限自检：扫一遍命令字符串，命中高危特征就要求审批。
-    args (dict): 大模型传入工具的入参字典，格式为 {"command": "..."}
-
+    run_command 专属安全拦截器：扫一遍命令，命中高危特征则返回 "ask" 要求用户手动审批。
     """
     command = args.get("command", "")
     if any(re.search(pattern, command) for pattern in DANGEROUS_PATTERNS):
@@ -100,10 +96,11 @@ def run_command_self_check(args: dict):
     # 没命中高危特征，交给通用规则决定
     return None
 
-#【注册表模式 (Registry Pattern)】
-# 将 run_command_self_check 函数作为回调引用，注册到 permissions 模块的 "run_command" key下。
+#【注册表模式 (Registry Pattern)】在 Python 里，函数也是一种数据类型，
+# 把 run_command_self_check 函数作为回调引用，注册到 permissions 模块的 "run_command" key下。
 # 当权限引擎校验 run_command 工具时，会自动查表并触发此回调函数。
 permissions.register_self_check("run_command", run_command_self_check)
+# permissions.register_self_check(run_command.__name__, run_command_self_check)
 
-# Pydantic AI 支持 tools=[plain_function]，从函数签名 + docstring 自动生成 JSON Schema
+# 导出工具列表，统一注册给 Agent 实例
 TOOLS = [read_file, write_file, run_command]

@@ -2,7 +2,7 @@
 权限管控系统 (Permissions Management System)
 
 职责：
-1. 状态管理：维护全局权限模式（default / acceptEdits / bypass）以及会话级放行白名单。
+1. 状态管理：维护全局权限模式（default / acceptEdits / bypass）与会话级“不再询问”白名单。
 2. 决策计算：根据模式、工具属性与自检结果，计算出放行 ("allow") 或 询问 ("ask")。
 3. 当需要询问时：基于 prompt_toolkit 渲染单选 Terminal UI 供用户选择。
 """
@@ -19,42 +19,38 @@ from prompt_toolkit.styles import Style
 
 
 # 三种权限模式: default / acceptEdits / bypass
-# default 模式：读文件放行，写文件、跑命令等高危操作需审批
+# default 模式：读行，写、跑命令需审批
 DEFAULT = "default"
-# acceptEdits 模式：读写文件放行，跑命令等高危操作需审批
+# acceptEdits 模式：读写都行，跑命令需审批
 ACCEPT_EDITS = "acceptEdits"
-# bypass 模式：一切放行，不再询问
+# bypass 模式：一切放行
 BYPASS = "bypass"
 
-# 权限模式按 Shift+Tab 循环切换的顺序
+# 权限模式按 Shift+Tab 切换模式
 MODES = [DEFAULT, ACCEPT_EDITS, BYPASS]
 
-# 只读工具，任何模式都自动放行（读取不会改动系统，放行没风险）
+# 只读工具表：无破坏力，任何模式下都直接放行
 READONLY_TOOLS = {"read_file"}
-# 编辑文件类工具，acceptEdits 模式下自动放行
+# 编辑文件类工具表，acceptEdits 模式下自动放行
 EDIT_TOOLS = {"write_file"}
 
-# 工具自检注册表字典: key 是工具名 ("run_command")，value 是回调函数 (run_command_self_check)
+# 工具自检注册表字典: key 为工具名（如 "run_command"），value 为自检函数 (run_command_self_check)
 TOOL_SELF_CHECKS = {}
 
 
 def register_self_check(tool_name: str, check) -> None:
     """
-    提供给各个工具模块的回调注册接口。
-    
-    Args:
-        tool_name: 工具名称 (如 "run_command")
-        check: 自检回调函数，接收 args 字典，返回 "ask" (强行要求审批) 或 None (交给通用规则)
+    提供给 tools 模块注册专属安全自检逻辑的接口
     """
     TOOL_SELF_CHECKS[tool_name] = check
-
+    # 相当于TOOL_SELF_CHECKS = {"run_command": <函数 run_command_self_check 在内存里的地址>}
 
 @dataclass
 class PermissionState:
     """
-    进程级权限状态：当前模式，加上本会话的放行白名单。
-    权限模式是进程级的：跨 /new、/resume 保持，不写进 jsonl，重启程序才回到 default。
-    白名单是会话级的：用 /new、/resume 切换会话时会清空。
+    权限全局状态：
+    - mode：进程级，重启程序恢复 default，跨 /new、/resume 会话保持。
+    - session_allowed：会话级白名单，点了「不再询问」的工具存这里，切会话时清空。
     """
     # 当前权限模式
     mode: str = DEFAULT
@@ -67,12 +63,13 @@ state = PermissionState()
 
 def compute_decision(tool_name: str, args: dict) -> str:
     """
-    纯规则判定：在当前模式下，对给定的工具调用返回 "allow" 或 "ask"。
+    核心决策引擎：评估当前工具调用是直接放行 ("allow") 还是拦截弹窗 ("ask")
     """
-    # bypass 模式：全部放行，连工具自检都不再过问（用户主动选择了这个模式，后果自负）
+    # bypass 模式：全部放行
     if state.mode == BYPASS:
         return "allow"
-    # 工具自检：自检要求审批的调用，会话白名单也盖不过
+    # 工具自检：此时才去调用tools.py里注册的 run_command_self_check()，检查命令是否高危
+    # 最高优先权：如果自检函数返回 "ask"，则直接要求用户审批
     check = TOOL_SELF_CHECKS.get(tool_name)
     if check and check(args) == "ask":
         return "ask"
@@ -91,7 +88,7 @@ def compute_decision(tool_name: str, args: dict) -> str:
 
 def cycle_mode() -> str:
     """
-    按 default -> acceptEdits -> bypass -> default 循环切换。
+    按 default -> acceptEdits -> bypass -> default tab切换。
     """
     index = MODES.index(state.mode)
     state.mode = MODES[(index + 1) % len(MODES)]
@@ -104,7 +101,7 @@ BULKY_ARGS = {"content", "old_string", "new_string"}
 
 def _format_call(tool_name: str, args: dict) -> str:
     """
-    把一次工具调用渲染成审批预览，例如 run_command(command=npm test)。
+    格式化工具调用预览，形如：run_command(command=npm test)
     """
     def show(key, value):
         text = " ".join(str(value).split())
@@ -126,7 +123,7 @@ _STYLE = Style.from_dict({
 # UI样式类
 class _ApprovalPicker:
     """
-    手绘单选审批 picker，视觉对齐 ask_user_question 的 picker。
+    手绘终端单选 UI：渲染选项、监听键盘上下键与回车确认
     """
 
     def __init__(self, question: str, options: list[tuple[str, str]]):

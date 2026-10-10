@@ -1,21 +1,21 @@
 """
-入口、主控循环 (REPL)
+入口与主控循环 (REPL)
 
 职责：
-1. UI 事件驱动：初始化 Repl 常驻输入界面，监听用户键盘提交事件。
-2. 斜杠命令拦截：优先解析 /help、/resume 等控制命令，隔离系统指令与模型对话。
-3. 白盒图引擎驱动：利用 agent.iter() 逐节点 (Node) 驱动 PydanticAI 状态机，实现实时终端渲染。
-4. 状态结算与持久化：每轮对话结束后，归集 Token 消耗、API 日志并写回磁盘 session 文件。
+1. 界面常驻：启动终端交互框 (Repl)，监听键盘回车提交。
+2. 命令拦截：优先解析以 / 开头的指令（如 /help, /resume），避免传给大模型。
+3. 白盒图引擎：用 agent.iter() 逐个节点 (Node) 驱动状态机，实现终端实时流式渲染。
+4. 结算与落盘：每轮对话结束后，统计 Token 消耗并持久化到本地 Session 文件。
 """
-import asyncio #标准库类似于 threading 的异步协程库，支持 async/await 语法
+import asyncio # Python 标准异步库，支持 async/await 协程语法
 
-from pydantic_ai import Agent
-# pydantic_graph：PydanticAI 底层依靠图状态机驱动，End 代表图执行终点节点，是pydantic自己写的langchain，每个请求都变成了node，需要end节点来结束
+from pydantic_ai import Agent # End 是 PydanticAI 图状态机的终点节点。每个模型请求/工具调用都是一个 Node，遇到 End 循环终止
+
 from pydantic_graph import End
 
 import session
 
-# 本地Agent文件夹 核心模块导入单例实例 agent、模型名称以及 API 调用的全局日志 Buffer
+# 从本地 agent 模块导入单例 agent 实例、模型名称、 API 调用日志缓存
 from agent import agent, MODEL_NAME, api_call_log
 
 # 本地UI文件夹 命令模块导入相关命令映射、状态类及渲染工具函数
@@ -30,7 +30,7 @@ from ui.commands import (
 # 导入手搓的终端常驻交互式输入组件 Repl
 from ui.input_ui import Repl
 
-async def handle_command(user_input, state):
+async def handle_command(user_input, state) -> str:
     """
     处理以 / 开头的命令。
     返回 'pass'：不是命令，交给 Agent；
@@ -45,8 +45,8 @@ async def handle_command(user_input, state):
         console.print(f"未知命令：/{cmd_name}，输入 /help 查看可用命令\n")
         return "continue"
     result = command.handler(state)
-    # 个别命令（如 /resume）要弹交互式列表，是异步的，需要 await
-    if asyncio.iscoroutine(result):
+    # 个别命令（如 /resume）要弹交互式列表，是异步函数，会返回一个coroutine，跑起来前面需要加 await
+    if asyncio.iscoroutine(result): 
         result = await result
     return "continue" if result else "break"
 
@@ -69,7 +69,7 @@ async def run_agent_loop(user_input, state):
     摒弃黑盒 run_sync()，使用 agent.iter() 逐节点 (Node) 驱动 Agent 图状态机流转。
     实现“边思考、边调工具、边实时输出”的流式效果。
     """
-    api_call_log.clear() # 每轮新对话发起前，清空全局 API 调用日志 Buffer
+    api_call_log.clear() # 每轮新对话发起前，清空全局 API 调用日志 Buffer（只记上次调用）
  
     # 开启 Agent 图迭代器上下文，传入当前输入 + 全量历史上下文 (state.history)
     async with agent.iter(user_input, message_history=state.history) as run: #iter是个异步的可迭代对象里面是多个节点（大模型请求和工具调用）
@@ -85,7 +85,8 @@ async def run_agent_loop(user_input, state):
 
             elif Agent.is_model_request_node(node):     # 节点类型判断 B：如果是“准备发起下一次模型请求”
                 for part in node.request.parts:
-                    if part.part_kind in ("tool-return", "retry-prompt"):
+                     #异常报错是agent会把报错包成一个“retry-prompt"part,用来给大模型理解错误原因
+                    if part.part_kind in ("tool-return", "retry-prompt"): 
                         print_part(part)                # 实时将“工具在本地执行返回的结果”渲染到终端
 
     apply_result(state, run.result)         # 当循环遇到 End 节点退出后，run.result 会自动结算出最终的 AgentRunResult
@@ -102,10 +103,9 @@ async def main():
     repl = Repl(state)
 
     async def on_submit(user_input):
-        # 每次回车提交一行输入，都走这里
-        # 先处理 / 开头的命令
+        # 用户每次按下回车提交，均触发此函数
 
-        # Step 1: 优先拦截并处理斜杠命令
+        # 1. 优先拦截并处理斜杠命令
         action = await handle_command(user_input, state)
         if action == "break":
             # 命令要求退出，结束常驻输入区
@@ -114,10 +114,10 @@ async def main():
         if action == "continue":
             return
 
-        # Step 2: 切换 Repl UI 状态为 working (显示思考中状态指示器)
+        # 2. 切换 UI 为工作状态（显示思考中动画/指示器）
         repl.start_working()
 
-        # Step 3: 进入白盒图循环，真正驱动 Agent 执行任务
+        # 3. 驱动 Agent 图状态机开始思考与执行
         await run_agent_loop(user_input, state)
 
     # 启动 Repl 事件循环，等待用户敲击回车唤起 on_submit

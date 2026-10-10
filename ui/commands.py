@@ -52,14 +52,6 @@ class SessionState:
     # 最近一轮 user input 触发的所有 model API 调用记录   
     last_api_calls: list = field(default_factory=list)
 
-
-def print_divider() -> None:
-    """
-    每轮交互之前打印一条分割线，区分输入区域。Rule 会自适应终端宽度。
-    """
-    console.print(Rule(style="grey50"))
-
-
 def _truncate(text, limit: int = 120) -> str:
     """
     截断并 escape，用于 tool 参数 / 返回值 / 用户输入这类可能过长的内容。
@@ -143,17 +135,6 @@ def print_part(part) -> None:
         # body 形如 "  [markup]…"，去掉字面前导 2 空格，交给 print_step 用 Padding 缩进（折行续行也保持缩进）
         print_step(label, body[2:])
 
-# 多个print_part循环打印
-def print_agent_steps(new_messages) -> None:
-    """
-    主循环里调用：显示这一轮 Agent 新增的中间过程（thinking、文本、工具调用、工具返回）。
-    """
-    for msg in new_messages:
-        for part in msg.parts:
-            # 主循环里不重复显示用户刚刚输入的内容
-            if part.part_kind == "user-prompt":
-                continue
-            print_part(part)
 
 # ================= 斜杠命令处理器 (Command Handlers) =================
 
