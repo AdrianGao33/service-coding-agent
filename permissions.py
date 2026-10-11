@@ -1,10 +1,10 @@
 """
-权限管控系统 (Permissions Management System)
+权限管控与终端单选审批系统 (Permissions Management System)
 
 职责：
-1. 状态管理：维护全局权限模式（default / acceptEdits / bypass）与会话级“不再询问”白名单。
+1. 模式管理：支持 DEFAULT (事事问)、ACCEPT_EDITS (自动改文件)、AUTO (LLM 智能审查)、BYPASS (全放行) 四种模式，快捷键 Shift+Tab 循环切换。
 2. 决策计算：根据模式、工具属性与自检结果，计算出放行 ("allow") 或 询问 ("ask")。
-3. 当需要询问时：基于 prompt_toolkit 渲染单选 Terminal UI 供用户选择。
+3. 终端交互：在需要人工确认时，使用 prompt_toolkit 渲染无缝的终端单选 UI 菜单。
 """
 
 from dataclasses import dataclass, field
@@ -23,11 +23,13 @@ from prompt_toolkit.styles import Style
 DEFAULT = "default"
 # acceptEdits 模式：读写都行，跑命令需审批
 ACCEPT_EDITS = "acceptEdits"
+# auto：本该弹窗的调用交给 LLM classifier 判定，安全就放行，危险才拦截
+AUTO = "auto"
 # bypass 模式：一切放行
 BYPASS = "bypass"
 
 # 权限模式按 Shift+Tab 切换模式
-MODES = [DEFAULT, ACCEPT_EDITS, BYPASS]
+MODES = [DEFAULT, ACCEPT_EDITS, AUTO, BYPASS]
 
 # 只读工具表：无破坏力，任何模式下都直接放行
 READONLY_TOOLS = {"read_file"}
@@ -65,30 +67,31 @@ def compute_decision(tool_name: str, args: dict) -> str:
     """
     核心决策引擎：评估当前工具调用是直接放行 ("allow") 还是拦截弹窗 ("ask")
     """
-    # bypass 模式：全部放行
+    # 1. bypass 模式：全部放行
     if state.mode == BYPASS:
         return "allow"
-    # 工具自检：此时才去调用tools.py里注册的 run_command_self_check()，检查命令是否高危
+    # 2. 工具自检：此时才去调用tools.py里注册的 run_command_self_check()，检查命令是否高危
     # 最高优先权：如果自检函数返回 "ask"，则直接要求用户审批
     check = TOOL_SELF_CHECKS.get(tool_name)
     if check and check(args) == "ask":
         return "ask"
-    # 本会话点过「不再询问」的工具：放行
+    # 3. 本会话点过「不再询问」的工具：放行
     if tool_name in state.session_allowed:
         return "allow"
-    # 只读工具：任何模式都自动放行
+    # 4. 只读工具：任何模式都自动放行
     if tool_name in READONLY_TOOLS:
         return "allow"
-    # acceptEdits 模式：编辑文件放行，命令等其他工具仍要审批
-    if state.mode == ACCEPT_EDITS and tool_name in EDIT_TOOLS:
+    # 5. Fast Path (快速通道)：acceptEdits 与 auto 模式下，写文件直接规则放行，无需发起 classifier 请求
+    # 假设一个构建代码的情景，需要write_file多次，频繁弹窗审批会让用户烦躁，独立auto大模型需要发起多次请求，增加延迟和成本
+    if state.mode in (ACCEPT_EDITS, AUTO) and tool_name in EDIT_TOOLS:
         return "allow"
-    # default 模式，或没命中任何放行规则：询问用户
+    # 6. default 模式，或没命中任何放行规则：询问用户
     return "ask"
 
 
 def cycle_mode() -> str:
     """
-    按 default -> acceptEdits -> bypass -> default tab切换。
+    按 default -> acceptEdits -> auto -> bypass -> default tab切换。
     """
     index = MODES.index(state.mode)
     state.mode = MODES[(index + 1) % len(MODES)]

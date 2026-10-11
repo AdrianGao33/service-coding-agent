@@ -6,7 +6,7 @@ Agent 生命周期钩子与切面拦截器 (Hooks & Middleware System)
 
 2. 网络容错重试：遇到 HTTP 5xx 或网络超时，以 2^n 秒指数退避自动重试（最多 3 次）
 
-3. 工具权限拦截：工具执行前，调用 permissions 模块弹窗审批，决定放行或拒绝
+3. 工具权限拦截：工具执行前，调用 permissions 模块弹窗审批，决定放行或拒绝，和 classifier 模块协作，自动审查工具调用安全性
 
 4. 工具崩溃兜底：捕获本地 Python 工具运行异常，降级为错误字符串还给大模型，防主进程崩塌
 """
@@ -18,8 +18,9 @@ from typing import Any
 from pydantic_ai.capabilities import Hooks
 from pydantic_ai.exceptions import ModelHTTPError, ModelAPIError
 
+import classifier
 import permissions
-from ui.render import console
+from ui.render import console, print_step
 
 MAX_RETRIES = 3
 
@@ -147,13 +148,33 @@ async def _check_permission(ctx, *, call, tool_def, args, handler):
         # 放行，handler(args) 才是真正执行工具的那一步
         return await handler(args)
 
-    # decision == "ask"，弹审批让用户决定
+ # 当规则要求询问 ("ask") 且处于 AUTO 模式：交由 classifier 智能审查
+    if permissions.state.mode == permissions.AUTO:
+        # 审查过程对齐成和 thinking、tool_call 一样的「图标 + 标签独占一行、内容换行」格式，用蓝色让用户一眼看到 classifier 在工作
+        print_step("[blue]◆ auto_check[/]", f"[blue dim]正在请 LLM 审查 {call.tool_name}...[/]")
+        verdict = await classifier.classify(ctx.messages, call.tool_name, args)
+
+        if verdict.get("error"):
+            # 分类器异常：打印警告，降级流转至下方的人工弹窗审批
+            print_step("[yellow]⚠ auto_check[/]", f"[yellow]{verdict['reason']}[/]")
+        elif not verdict["should_block"]:
+            # 分类器判定安全：自动放行并打印依据理由
+            print_step("[blue]✔ auto_check[/]", f"[blue dim]放行：{verdict['reason']}[/]")
+            return await handler(args)
+        else:
+            # 分类器判定危险：打断执行，将拦截理由作为提示词发还模型，要求其停止并请示用户
+            print_step("[red]✘ auto_check[/]", f"[red]拦截：{verdict['reason']}[/]")
+            return (
+                f"安全检查拦截了这次 {call.tool_name} 调用，没有执行。拦截理由：{verdict['reason']}。"
+                "不要尝试绕过拦截，请停下来向用户说明情况，由用户决定接下来怎么做。"
+            )
+
+    # 规则要求询问且处于 DEFAULT 模式（或 AUTO 模式分类器出错降级）：弹出终端单选 UI 供用户人工审批
     choice = await permissions.prompt_approval(call.tool_name, args)
     if choice == "once":
         return await handler(args)
     if choice == "always":
-        # 记进会话白名单，本会话内这个工具不再询问
-        permissions.state.session_allowed.add(call.tool_name) # 动态将工具名注入到当前进程的状态白名单中
+        permissions.state.session_allowed.add(call.tool_name) # 记进会话白名单，本会话内这个工具不再询问
         return await handler(args)
 
     # 拒绝：不执行工具，把拒绝原因回填给模型，让它停下来等用户发话，而不是自作主张绕过去
