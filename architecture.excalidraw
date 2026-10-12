@@ -1082,7 +1082,7 @@
       "type": "text",
       "x": -1881.555555555552,
       "y": -1486.4444444444468,
-      "width": 432,
+      "width": 509,
       "height": 75,
       "angle": 0,
       "strokeColor": "#0c8599",
@@ -1097,8 +1097,8 @@
       "index": "b12",
       "roundness": null,
       "seed": 1234454555,
-      "version": 576,
-      "versionNonce": 1284524123,
+      "version": 586,
+      "versionNonce": 1456561467,
       "isDeleted": false,
       "boundElements": [
         {
@@ -1106,26 +1106,26 @@
           "type": "arrow"
         }
       ],
-      "updated": 1791623816599,
+      "updated": 1791738005098,
       "link": null,
       "locked": false,
-      "text": "3种模式：DEFAULT \\ ACCEPT_EDITS \\ BYPASS\n2个列表：READONLY_TOOLS表、EDIT_TOOLS表\n1个字典：TOOL_SELF_CHECKS",
+      "text": "4种模式：DEFAULT \\ ACCEPT_EDITS \\ BYPASS \\ AUTO\n2个列表：READONLY_TOOLS表、EDIT_TOOLS表\n1个字典：TOOL_SELF_CHECKS",
       "fontSize": 20,
       "fontFamily": 8,
       "textAlign": "left",
       "verticalAlign": "top",
       "containerId": null,
-      "originalText": "3种模式：DEFAULT \\ ACCEPT_EDITS \\ BYPASS\n2个列表：READONLY_TOOLS表、EDIT_TOOLS表\n1个字典：TOOL_SELF_CHECKS",
+      "originalText": "4种模式：DEFAULT \\ ACCEPT_EDITS \\ BYPASS \\ AUTO\n2个列表：READONLY_TOOLS表、EDIT_TOOLS表\n1个字典：TOOL_SELF_CHECKS",
       "autoResize": true,
       "lineHeight": 1.25
     },
     {
       "id": "GUVVvFdCsbmoA9O9mJlnz",
       "type": "arrow",
-      "x": -1624.5844255191034,
-      "y": -1500.4444444444468,
-      "width": 173.36220329688217,
-      "height": 229.83333333333462,
+      "x": -1599.2595672021491,
+      "y": -1500.4444444444466,
+      "width": 165.01498387109973,
+      "height": 229.83333333333508,
       "angle": 0,
       "strokeColor": "#1e1e1e",
       "backgroundColor": "transparent",
@@ -1141,11 +1141,11 @@
         "type": 2
       },
       "seed": 1712993275,
-      "version": 1606,
-      "versionNonce": 619225109,
+      "version": 1619,
+      "versionNonce": 281542107,
       "isDeleted": false,
       "boundElements": null,
-      "updated": 1791623835259,
+      "updated": 1791738005099,
       "link": null,
       "locked": false,
       "points": [
@@ -1154,12 +1154,12 @@
           0
         ],
         [
-          173.36220329688217,
-          -130.83333333333496
+          148.03734497992787,
+          -130.8333333333352
         ],
         [
-          8.34721942578335,
-          -229.83333333333462
+          -16.977638891171864,
+          -229.83333333333508
         ]
       ],
       "lastCommittedPoint": null,
@@ -3047,6 +3047,43 @@
       "verticalAlign": "middle",
       "containerId": "QXLg__VflooHBXNGKHTGG",
       "originalText": "执行时候\n模式判断",
+      "autoResize": true,
+      "lineHeight": 1.25
+    },
+    {
+      "id": "2Py9oFcz1JnJT0J636aXm",
+      "type": "text",
+      "x": -892.3055555555588,
+      "y": -421.99999999998965,
+      "width": 2046,
+      "height": 25,
+      "angle": 0,
+      "strokeColor": "#f08c00",
+      "backgroundColor": "transparent",
+      "fillStyle": "solid",
+      "strokeWidth": 2,
+      "strokeStyle": "solid",
+      "roughness": 1,
+      "opacity": 100,
+      "groupIds": [],
+      "frameId": null,
+      "index": "b1x",
+      "roundness": null,
+      "seed": 673203573,
+      "version": 3,
+      "versionNonce": 1076571189,
+      "isDeleted": false,
+      "boundElements": null,
+      "updated": 1791794417285,
+      "link": null,
+      "locked": false,
+      "text": "它把磁盘上的文件文本按行拆成列表，把人类习惯的“从第 100 行开始”换算成 Python 列表索引 [99:149]；切出这部分内容存入账本，最后加上右对齐的行号（并在没读完时带上“续读指南”）拼接成漂亮的字符串返回给大模型。",
+      "fontSize": 20,
+      "fontFamily": 8,
+      "textAlign": "left",
+      "verticalAlign": "top",
+      "containerId": null,
+      "originalText": "它把磁盘上的文件文本按行拆成列表，把人类习惯的“从第 100 行开始”换算成 Python 列表索引 [99:149]；切出这部分内容存入账本，最后加上右对齐的行号（并在没读完时带上“续读指南”）拼接成漂亮的字符串返回给大模型。",
       "autoResize": true,
       "lineHeight": 1.25
     }

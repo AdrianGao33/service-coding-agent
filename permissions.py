@@ -34,7 +34,7 @@ MODES = [DEFAULT, ACCEPT_EDITS, AUTO, BYPASS]
 # 只读工具表：无破坏力，任何模式下都直接放行
 READONLY_TOOLS = {"read_file"}
 # 编辑文件类工具表，acceptEdits 模式下自动放行
-EDIT_TOOLS = {"write_file"}
+EDIT_TOOLS = {"write_file", "edit_file"}
 
 # 工具自检注册表字典: key 为工具名（如 "run_command"），value 为自检函数 (run_command_self_check)
 TOOL_SELF_CHECKS = {}

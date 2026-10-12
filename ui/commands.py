@@ -6,19 +6,20 @@ ui/commands.py - 终端 UI 渲染中心与斜杠系统命令处理
 2. 消息 Part 格式化：给 Prompt、Thinking、Text、ToolCall 等节点配上颜色图标与美化缩进。
 3. 斜杠命令注册：实现 /new, /resume, /status, /api-detail, /help, /exit 命令的处理逻辑。
 """
-
+import difflib
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 # 从 Rich 库导入终端渲染的核心组件
 import questionary #cmdline 交互式选择库，支持上下键选择、回车确认
+from prompt_toolkit.application import in_terminal
 from rich.markdown import Heading, Markdown
 from rich.markup import escape
 from rich.padding import Padding
-from rich.rule import Rule
 
 import permissions
 import session
+from agent import ReadFileState
 from .render import console, print_step, print_welcome_banner
 
 
@@ -48,6 +49,7 @@ class SessionState:
     model_name: str = ""
     session_id: str = ""                                # 当前会话 ID（决定写入哪个 jsonl 文件）  
     last_api_calls: list = field(default_factory=list)  # 最近一轮对话触发的 API 调用日志
+    read_file_state: ReadFileState = field(default_factory=ReadFileState)  # 本会话的 readFileState，注入给文件工具；切换会话时换上新实例
 
 def _truncate(text, limit: int = 120) -> str:
     """
@@ -112,6 +114,72 @@ def print_assistant_markdown(content: str) -> None:
     # Markdown 是块级渲染对象，没法跟在行内前缀后面，所以另起一行渲染；左缩进 2 格和 role 名对齐
     console.print(Padding(Markdown(content), (0, 0, 0, 2)))
 
+# read / write 内容预览最多显示的行数，超出的折叠成「… +N 行」
+_PREVIEW_MAX_LINES = 8
+
+def _preview_numbered(content: str) -> Optional[str]:
+    """
+    把内容加绿色行号、截断成预览，用于 write_file 的写入内容展示。
+    """
+    lines = content.splitlines()
+    if not lines:
+        return None
+    width = len(str(len(lines)))
+    shown = lines[:_PREVIEW_MAX_LINES]
+    out = [f"  [green]{i:>{width}}[/] {escape(ln)}" for i, ln in enumerate(shown, 1)]
+    if len(lines) > _PREVIEW_MAX_LINES:
+        out.append(f"  [dim]… +{len(lines) - _PREVIEW_MAX_LINES} 行[/]")
+    return "\n".join(out)
+
+
+def _preview_diff(old: str, new: str) -> str:
+    """
+    用 difflib 把 old -> new 渲染成红绿 diff：删除行红、新增行绿、不变行 dim。
+    """
+    out = []
+    for line in difflib.ndiff(old.splitlines(), new.splitlines()):
+        tag, body = line[:2], escape(line[2:])
+        if tag == "- ":
+            out.append(f"  [red]- {body}[/]")
+        elif tag == "+ ":
+            out.append(f"  [green]+ {body}[/]")
+        elif tag == "  ":
+            out.append(f"  [dim]  {body}[/]")
+        # "? " 是 difflib 的字符级提示行，跳过不显示
+    return "\n".join(out)
+
+
+def _print_file_op(part) -> bool:
+    """
+    文件工具的富展示：edit 红绿 diff、write 带行号写入预览、read 带行号读取结果。返回 True 表示已处理。
+    """
+    # 这里按工具名特判，没像 permissions 那样建注册表：展示逻辑依赖 rich，若让工具层注册渲染器，agent 层就会反向依赖 UI 层，得不偿失
+    kind = part.part_kind
+    if kind == "tool-call" and part.tool_name in ("edit_file", "write_file"):
+        args = part.args_as_dict()
+        path = escape(str(args.get("path", "")))
+        # edit / write 的标签行与「工具名(路径)」内容行格式一致，统一打印，只有下方的预览不同
+        console.print("[yellow]⏺ tool_call[/]")
+        console.print(Padding(f"[yellow dim]{part.tool_name}({path})[/]", (0, 0, 0, 2)))
+        if part.tool_name == "edit_file":
+            console.print(_preview_diff(args.get("old_string", ""), args.get("new_string", "")))
+        else:
+            block = _preview_numbered(args.get("content", ""))
+            if block:
+                console.print(block)
+        return True
+    if kind == "tool-return" and part.tool_name == "read_file":
+        # read_file 的返回已经是带行号的内容，按行截断预览
+        console.print("[magenta]✔ tool_return[/]")
+        console.print(Padding("[magenta dim]read_file[/]", (0, 0, 0, 2)))
+        lines = str(part.content).splitlines()
+        for ln in lines[:_PREVIEW_MAX_LINES]:
+            console.print(f"  [dim]{escape(ln)}[/]")
+        if len(lines) > _PREVIEW_MAX_LINES:
+            console.print(f"  [dim]… +{len(lines) - _PREVIEW_MAX_LINES} 行[/]")
+        return True
+    return False
+
 # _format_part_line判断转换过后，打印
 def print_part(part) -> None:
     """
@@ -123,6 +191,10 @@ def print_part(part) -> None:
             print_assistant_markdown(content)
             # 每个 role block 末尾留一个空行，块与块之间不那么挤
             console.print()
+        return
+    # 文件工具（read / edit / write）走专门的富展示
+    if _print_file_op(part):
+        console.print()
         return
     line = _format_part_line(part)
     if line:
@@ -164,6 +236,7 @@ def cmd_new(state: SessionState) -> bool:
     state.last_api_calls.clear()
     state.session_id = session.new_session_id()
     permissions.state.session_allowed.clear()
+    state.read_file_state = ReadFileState()
     console.print("已开启新会话\n")
     return True
 
@@ -177,7 +250,7 @@ def _summary_line(mtime, prompt: str) -> str:
     return f"{mtime:%m-%d %H:%M}  {prompt}"
 
 
-def cmd_resume(state: SessionState) -> bool:
+async def cmd_resume(state: SessionState) -> bool:
     """
     恢复历史会话：调用 session.py 扫描磁盘历史，弹 Questionary 交互菜单供用户选择并回放上下文
     """
@@ -194,9 +267,10 @@ def cmd_resume(state: SessionState) -> bool:
         for sid, mtime, prompt in sessions
     ]
     # 交互式选择菜单，用户上下键移动，回车确认
-    selected = questionary.select(
-        "选择要恢复的会话（上下键移动，回车确认）：", choices=choices
-    ).ask()
+    async with in_terminal():
+        selected = await questionary.select(
+            "选择要恢复的会话（上下键移动，回车确认）：", choices=choices
+        ).ask_async()
     
     # 用户按 Ctrl+C 取消选择
     if selected is None:
@@ -207,6 +281,8 @@ def cmd_resume(state: SessionState) -> bool:
     state.session_id = selected
     # 权限白名单是会话级的，切换会话后清空
     permissions.state.session_allowed.clear()
+    # readFileState 也是会话级的，切换会话后换上新实例。恢复的历史里虽有读取痕迹，但进程退出后文件可能已变、mtime 不再可信，让模型恢复后首次编辑重读一次更稳
+    state.read_file_state = ReadFileState()
 
     # 2. 重新累加盘存历史 Token 消耗
     # jsonl 里每条模型回复都带 usage，把会话的 token 用量累加回来
@@ -230,6 +306,7 @@ def cmd_resume(state: SessionState) -> bool:
 
 def cmd_status(state: SessionState) -> bool:
     console.print(f"模型：           {state.model_name}")
+    console.print(f"权限模式：       {permissions.state.mode}")
     console.print(f"历史消息条数：    {len(state.history)}")
     console.print(f"累计输入 tokens：{state.input_tokens}")
     console.print(f"累计输出 tokens：{state.output_tokens}\n")

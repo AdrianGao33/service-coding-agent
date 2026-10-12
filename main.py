@@ -72,7 +72,7 @@ async def run_agent_loop(user_input, state):
     api_call_log.clear() # 每轮新对话发起前，清空全局 API 调用日志 Buffer（只记上次调用）
  
     # 开启 Agent 图迭代器上下文，传入当前输入 + 全量历史上下文 (state.history)
-    async with agent.iter(user_input, message_history=state.history) as run: #iter是个异步的可迭代对象里面是多个节点（大模型请求和工具调用）
+    async with agent.iter(user_input, message_history=state.history, deps=state.read_file_state) as run: #iter是个异步的可迭代对象里面是多个节点（大模型请求和工具调用）
         node = run.next_node
         
         # 只要当前节点不是终点 End，就一直在图状态机里往下走
