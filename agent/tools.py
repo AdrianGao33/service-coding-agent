@@ -23,6 +23,7 @@ Coding Agent 用到的三个工具：读文件、写文件、跑 shell 命令。
 # 能严格区分独立的危险命令（如单独的 rm），避免误伤包含相同字母的正常单词（如 terminal 或 format）。
 import os
 import re 
+import shlex
 import subprocess
 
 # PydanticAI 专有异常：抛出后框架会自动生成 retry-prompt 塞回给大模型，要求其修正参数重试
@@ -48,6 +49,35 @@ def _with_line_numbers(content: str, start_line: int = 1) -> str:
     width = len(str(start_line + len(lines) - 1))
     return "\n".join(f"{i:>{width}}\t{line}" for i, line in enumerate(lines, start_line))
 
+def read_and_register(state: ReadFileState, path: str, offset: int = 1, limit: int | None = None) -> str:
+    """
+    读取文件、按 offset/limit 切片、登记进 readFileState，返回带行号的内容。
+    read_file 工具和 @ 引用注入都调用它，所以经 @ 引入的文件和模型自己读的文件，在 readFileState 里长得一模一样。
+    """
+    # 1. 读取文件全文
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()  #格式化1：这边的问题就是读完 文本会被拉长成一个大字符串，原文本的行会用无数个 /n 表达
+
+    # 2. 第一次读完处理格式：按 offset/limit 切片：不指定 limit 时最多取 DEFAULT_MAX_LINES 行
+    all_lines = content.splitlines()    # 格式化2：把长str，变成列表拿掉/n：['第1行内容...', '第2行内容...', ...]
+    total = len(all_lines)
+    start = offset - 1
+    if start >= total and total > 0:
+        return f"警告：文件只有 {total} 行，但 offset 是 {offset}，没有内容可读"
+    end = start + limit if limit is not None else start + DEFAULT_MAX_LINES
+    selected = all_lines[start:end]  # 格式化3：从全量列表里，取出要用的切片
+    selected_content = "\n".join(selected)   # 格式化4：用/n组装回长str
+    truncated = limit is None and end < total   #boolean，是否被截断了（没指定 limit 且 end < total）
+
+    # 3. 登记进会话的 readFileState：存重新组装还原的长str
+    state.record(path, selected_content, offset=offset, limit=limit)
+
+    # 4. 返回给模型的是带行号的版本；如果被截断，末尾附提示
+    result = _with_line_numbers(selected_content, start_line=offset) # 调用 _with_line_numbers，虽然还是大str，但是有行号模型读的更方便
+    if truncated:
+        result += f"\n\n（文件共 {total} 行，还有 {total - end} 行未显示。用 offset={end + 1} 继续读取）"
+    return result
+
 # 读取文件内容（带行号格式）。大文件支持 offset/limit 分段读取。
 # 后续用 edit_file 编辑时，old_string/new_string 不要包含行号前缀。
 def read_file(ctx: RunContext[ReadFileState], path: str, offset: int = 1, limit: int | None = None) -> str:
@@ -71,10 +101,9 @@ def read_file(ctx: RunContext[ReadFileState], path: str, offset: int = 1, limit:
             except FileNotFoundError:
                 pass
 
-    # 2. 读取文件全文
+    # 2. 读取 + 登记都交给 read_and_register，异常在这里转成 ModelRetry 反馈给模型
     try:
-        with open(path, "r", encoding="utf-8") as f: 
-            content = f.read()      #格式化1：这边的问题就是读完 文本会被拉长成一个大字符串，原文本的行会用无数个 /n 表达
+        return read_and_register(ctx.deps, path, offset, limit)
     except FileNotFoundError:
         raise ModelRetry(f"文件 {path} 不存在，请确认路径或换一个文件")
     except PermissionError:
@@ -84,25 +113,6 @@ def read_file(ctx: RunContext[ReadFileState], path: str, offset: int = 1, limit:
     except UnicodeDecodeError:
         return f"错误：{path} 不是文本文件，无法读取"
 
-    # 3. 第一次读完处理格式：按 offset/limit 切片：不指定 limit 时最多取 DEFAULT_MAX_LINES 行
-    all_lines = content.splitlines()    # 格式化2：把长str，变成列表拿掉/n：['第1行内容...', '第2行内容...', ...]
-    total = len(all_lines)  
-    start = offset - 1  # 从0开始的索引
-    if start >= total and total > 0:
-        return f"警告：文件只有 {total} 行，但 offset 是 {offset}，没有内容可读"
-    end = start + limit if limit is not None else start + DEFAULT_MAX_LINES
-    selected = all_lines[start:end]     # 格式化3：从全量列表里，取出要用的切片
-    selected_content = "\n".join(selected)  # 格式化4：用/n组装回长str
-    truncated = limit is None and end < total #boolean，是否被截断了（没指定 limit 且 end < total）
-
-    # 4. 登记进会话的 readFileState：存重新组装还原的长str
-    ctx.deps.record(path, selected_content, offset=offset, limit=limit)
-
-    # 5. 返回给模型的是带行号的版本；如果被截断，末尾附提示
-    result = _with_line_numbers(selected_content, start_line=offset) # 调用 _with_line_numbers，虽然还是大str，但是有行号模型读的更方便
-    if truncated:   # 如果刚才触发了“默认截断”：
-        result += f"\n\n（文件共 {total} 行，还有 {total - end} 行未显示。用 offset={end + 1} 继续读取）"
-    return result
 
 def edit_file(ctx: RunContext[ReadFileState], path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
     """
@@ -217,6 +227,23 @@ DANGEROUS_PATTERNS = [
     r"\bmkfs\w*\b",     # 格式化文件系统指令 (如 mkfs, mkfs.ext4)
 ]
 
+# 白名单：严格认可的保守只读命令列表
+READONLY_COMMANDS = {"ls", "cat", "head", "tail", "grep", "wc", "pwd"}
+# Shell 元字符：涉及管道 |、重定向 >/calc<、串联 ;/&&、环境变量/命令替换 $()`\n 的一律拒绝判定为只读
+SHELL_META = re.compile(r"[;&|<>`$\n]")
+
+def is_readonly_command(command: str) -> bool:
+    """
+    保守地判断命令是否只读：必须是白名单里的单条命令，不带任何 shell 元字符。
+    """
+    if SHELL_META.search(command):  # 1. 发现任何管道、重定向、分号组合拳，直接返回 False
+        return False
+    try:    # 2. 使用 shlex 展开词法分析（处理空格与引号路径），提取第一个 Token 主命令
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    # 3. 校验主命令是否在只读白名单内
+    return bool(tokens) and tokens[0] in READONLY_COMMANDS
 
 def run_command_self_check(args: dict):
     """
@@ -225,6 +252,8 @@ def run_command_self_check(args: dict):
     command = args.get("command", "")
     if any(re.search(pattern, command) for pattern in DANGEROUS_PATTERNS):
         return "ask"
+    if is_readonly_command(command):
+        return "allow"
     # 没命中高危特征，交给通用规则决定
     return None
 

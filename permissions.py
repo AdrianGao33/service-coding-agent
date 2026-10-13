@@ -73,8 +73,9 @@ def compute_decision(tool_name: str, args: dict) -> str:
     # 2. 工具自检：此时才去调用tools.py里注册的 run_command_self_check()，检查命令是否高危
     # 最高优先权：如果自检函数返回 "ask"，则直接要求用户审批
     check = TOOL_SELF_CHECKS.get(tool_name)
-    if check and check(args) == "ask":
-        return "ask"
+    verdict = check(args) if check else None
+    if verdict:
+        return verdict
     # 3. 本会话点过「不再询问」的工具：放行
     if tool_name in state.session_allowed:
         return "allow"

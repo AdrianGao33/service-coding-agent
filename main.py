@@ -6,6 +6,7 @@
 2. 命令拦截：优先解析以 / 开头的指令（如 /help, /resume），避免传给大模型。
 3. 白盒图引擎：用 agent.iter() 逐个节点 (Node) 驱动状态机，实现终端实时流式渲染。
 4. 结算与落盘：每轮对话结束后，统计 Token 消耗并持久化到本地 Session 文件。
+5. 引用文件预处理：@文件，预读，更新session的read_file_state
 """
 import asyncio # Python 标准异步库，支持 async/await 协程语法
 
@@ -29,6 +30,7 @@ from ui.commands import (
 
 # 导入手搓的终端常驻交互式输入组件 Repl
 from ui.input_ui import Repl
+from mentions import build_mention_messages, extract_at_mentions
 
 async def handle_command(user_input, state) -> str:
     """
@@ -62,7 +64,27 @@ def apply_result(state, result):
     state.last_api_calls = list(api_call_log)
     # 把本轮新增的消息追加到会话文件
     session.append_messages(state.session_id, result.new_messages())
-    
+
+def inject_at_mentions(user_input, state):
+    """
+    解析用户输入里的 @path，把每个被引用的文件伪装成一次 read_file 调用，在 Agent 跑起来之前塞进对话历史。
+    """
+    paths = extract_at_mentions(user_input) #提取@后面的路径
+    if not paths:
+        return
+    mention_messages = build_mention_messages(paths, state.read_file_state) # 2. 读取文件、登记 ReadFileState 账本，并构建成对的伪造消息 (ModelResponse + ModelRequest)
+    if not mention_messages:
+        return
+    # 塞进历史上下文：模型下一轮就能看到这些「读文件」记录，以为是自己读的
+    state.history += mention_messages
+    # 更新jsonl持久化，/resume 恢复会话时能连同引用进来的文件内容一起还原
+    session.append_messages(state.session_id, mention_messages)
+    # 终端里也回显一下注入了哪些文件，让用户看到 @ 引用确实生效了
+    for msg in mention_messages:
+        for part in msg.parts:
+            print_part(part)
+
+
 async def run_agent_loop(user_input, state):
     """
     核心白盒驱动引擎：
@@ -113,6 +135,9 @@ async def main():
             return
         if action == "continue":
             return
+
+        # 解析 @ 引用，把被引用的文件伪装成 read_file 调用塞进历史
+        inject_at_mentions(user_input, state)
 
         # 2. 切换 UI 为工作状态（显示思考中动画/指示器）
         repl.start_working()
