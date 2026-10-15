@@ -51,7 +51,7 @@ def _with_line_numbers(content: str, start_line: int = 1) -> str:
 
 def read_and_register(state: ReadFileState, path: str, offset: int = 1, limit: int | None = None) -> str:
     """
-    读取文件、按 offset/limit 切片、登记进 readFileState，返回带行号的内容。
+    读取文件、按 offset/limit 切片、登记进 readFileState(大str)，返回带行号的内容。
     read_file 工具和 @ 引用注入都调用它，所以经 @ 引入的文件和模型自己读的文件，在 readFileState 里长得一模一样。
     """
     # 1. 读取文件全文

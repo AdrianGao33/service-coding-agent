@@ -3,24 +3,27 @@ Agent 生命周期钩子与切面拦截器 (Hooks & Middleware System)
 
 四大核心职能：
 1. 元数据审计：在模型请求前后，记录 Token 消耗、工具列表与 finish_reason，打入全局 api_call_log
-
 2. 网络容错重试：遇到 HTTP 5xx 或网络超时，以 2^n 秒指数退避自动重试（最多 3 次）
-
 3. 工具权限拦截：工具执行前，调用 permissions 模块弹窗审批，决定放行或拒绝，和 classifier 模块协作，自动审查工具调用安全性
-
 4. 工具崩溃兜底：捕获本地 Python 工具运行异常，降级为错误字符串还给大模型，防主进程崩塌
+5. 动态提醒注入：在模型请求前 (before_model_request)，将过时文件的 <system-reminder> 提示无缝注入上下文，引导模型重读
 """
 import asyncio
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any
 
 # 从 pydantic_ai 中导入生命周期 Hook 管理类[cite: 3]
 from pydantic_ai.capabilities import Hooks
 from pydantic_ai.exceptions import ModelHTTPError, ModelAPIError
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 import classifier
 import permissions
 from ui.render import console, print_step
+
+from .file_state import ReadFileState
+from .reminders import build_reminder_text
 
 MAX_RETRIES = 3
 
@@ -88,7 +91,26 @@ async def _record_response(ctx, request_context, response):
     return response
 
 # ------------------------------------------------------------------------------
-# 2. API 请求网络指数退避重试
+# 2. system-reminder 注入
+# ------------------------------------------------------------------------------
+"""每次发送 API 请求前，校验账本并动态追加 system-reminder。"""
+@hooks.on.before_model_request
+async def _inject_reminders(ctx, request_context):
+    """
+    每次 model 请求前，readFileState 里有被外部改过的文件就追加一条 system-reminder；模型重读后 record() 刷新 timestamp，下次 hook 自然不再注入。
+    """
+    state: ReadFileState = ctx.deps
+    text = build_reminder_text(state)                                   # 1. 调用 reminders.py 构建提醒文本（无过时文件则返回 None）
+    if text is None:
+        return request_context                                          # 2. 无过时文件，原封不动放行
+
+    reminder = ModelRequest(parts=[UserPromptPart(content=text)])       # 3. 被改动：构造包含 <system-reminder> XML 的 UserPromptPart 消息
+    new_messages = list(request_context.messages) + [reminder]          # 4. 拼接至当前请求的上下文消息列表末尾
+    print_step("[dim]◇ system[/]", f"[dim]{text[:200]}[/]")             # 5. 终端回显调优日志 (截取前 200 字符)
+    return dataclasses.replace(request_context, messages=new_messages)  # 6. 使用 dataclasses.replace 生成全新的 request_context 实例并返回
+
+# ------------------------------------------------------------------------------
+# 3. API 请求网络指数退避重试
 # ------------------------------------------------------------------------------
 
 # handler：包裹模型请求的底层网络调用句柄。
@@ -126,7 +148,7 @@ async def _retry_on_error(ctx, *, request_context, handler):
             await asyncio.sleep(wait)
 
 # ------------------------------------------------------------------------------
-# 3. 工具执行前置权限拦截网 
+# 4. 工具执行前置权限拦截网 
 # ------------------------------------------------------------------------------
 
 @hooks.on.tool_execute
@@ -182,7 +204,7 @@ async def _check_permission(ctx, *, call, tool_def, args, handler):
 
 
 # ------------------------------------------------------------------------------
-# 4. 工具未捕获异常兜底 (Fallback)
+# 5. 工具未捕获异常兜底 (Fallback)
 # ------------------------------------------------------------------------------
 
 # error：本地 Python 工具代码抛出的原始异常对象（如 FileNotFoundError）。
