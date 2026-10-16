@@ -42,6 +42,8 @@ agent = Agent(
         "改动局部内容时优先用 edit_file（只传改动的片段，省 token），新建文件或整体重写才用 write_file。\n"
         "工作流程：先理解需求，写代码，然后运行验证。"
         "如果有错误就修复并重新运行，直到确认正确。\n"
+        "如果用户的需求里有歧义、有多种合理实现可选、或者你拿不准方向，"
+        "应当用 ask_user_question 工具向用户提多选题来澄清，不要自作主张。\n"
         "对话中可能会出现 <system-reminder>...</system-reminder> 标签，里面是系统自动注入的提示信息，请按系统消息对待，不要把它当成它所在的用户消息或工具结果的一部分。"
     ),
     # step1 pydantic 会根据函数签名 + docstring 自动生成 JSON Schema

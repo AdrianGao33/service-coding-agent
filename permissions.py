@@ -32,7 +32,8 @@ BYPASS = "bypass"
 MODES = [DEFAULT, ACCEPT_EDITS, AUTO, BYPASS]
 
 # 只读工具表：无破坏力，任何模式下都直接放行
-READONLY_TOOLS = {"read_file"}
+# ask_user_question 工具本身就是问用户，再过审批就套娃，和 read_file 同等放行
+READONLY_TOOLS = {"read_file", "ask_user_question"}
 # 编辑文件类工具表，acceptEdits 模式下自动放行
 EDIT_TOOLS = {"write_file", "edit_file"}
 

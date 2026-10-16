@@ -1,37 +1,19 @@
 """
-Coding Agent 用到的三个工具：读文件、写文件、跑 shell 命令。
+文件相关工具：read_file / edit_file / write_file，以及共享的 read_and_register 辅助函数。
 
-核心设计：
-1. 声明即 Schema：函数的类型提示 (Type hint) + 文档注释 (docstring) 会被 PydanticAI
-   自动打包成 JSON Schema 发给大模型，大模型据此感知工具名称、功能与入参格式。
+read_file 读完会把文件登记进会话的 readFileState；edit_file 和 write_file 改文件前先查登记，
+没读过、或读完又被改过都不放行，从根上防住「凭幻觉乱改」和「覆盖掉别人的改动」。
 
-2. 错误分级治理：
-   - raise ModelRetry模型可修正错误：抛出 raise ModelRetry(...) 触发框架让大模型自我纠错重试；
-   - return执行客观报错：返回 "错误/日志..." 字符串，作为工具结果交由大模型看日志 Debug；
-   - 严重崩溃：依靠全局 Hook 捕获底层未知异常。   
-
-3. 安全拦截：搭配 permissions 模块注册高危特征检查（如 rm、sudo），执行前触发审批。
-
-4. 状态管理 (ReadFileState)：
-    - 依赖注入：利用 RunContext[ReadFileState] 共享跨工具的会话级文件状态账本。
-    - 防盲改与防竞态：强约束“先读后改”，通过 mtime 时间戳与 snapshot 内容对比拦截过期修改。
-    - 精准编辑与切片：read_file 输出行号并支持分页；edit_file 提供上下文唯一性校验与局部替换。
-    - 串行化保障：对写操作施加 Tool(..., sequential=True)，防止同轮 Tool Call 并发写盘导致踩踏。
+readFileState 通过 RunContext 作为依赖注入，每个会话各有一份互不干扰的状态。
 """
 
-# re 是 Python 正则表达式库，这里用来精准扫描命令文本；通过 \b（单词边界）约束，
-# 能严格区分独立的危险命令（如单独的 rm），避免误伤包含相同字母的正常单词（如 terminal 或 format）。
 import os
-import re 
-import shlex
-import subprocess
 
+from pydantic_ai import RunContext
 # PydanticAI 专有异常：抛出后框架会自动生成 retry-prompt 塞回给大模型，要求其修正参数重试
 from pydantic_ai.exceptions import ModelRetry
-from pydantic_ai import RunContext, Tool
 
-import permissions
-from .file_state import ReadFileState
+from ..file_state import ReadFileState
 
 DEFAULT_MAX_LINES = 2000
 
@@ -113,7 +95,6 @@ def read_file(ctx: RunContext[ReadFileState], path: str, offset: int = 1, limit:
     except UnicodeDecodeError:
         return f"错误：{path} 不是文本文件，无法读取"
 
-
 def edit_file(ctx: RunContext[ReadFileState], path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
     """
     在文件里精确替换字符串，只传改动的片段，省 token。
@@ -169,7 +150,6 @@ def edit_file(ctx: RunContext[ReadFileState], path: str, old_string: str, new_st
     ctx.deps.record(path, updated)
     return f"已编辑 {path}（替换 {count if replace_all else 1} 处）"
 
-
 def write_file(ctx: RunContext[ReadFileState], path: str, content: str) -> str:
     """
     把内容整体写入文件，已有文件会被覆盖。
@@ -195,80 +175,3 @@ def write_file(ctx: RunContext[ReadFileState], path: str, content: str) -> str:
     # 新写入的内容同样登记进 readFileState，后续要再改就不必重读
     ctx.deps.record(path, content)
     return f"已写入 {path}"
-    
-def run_command(command: str) -> str:
-    """
-    执行一条 shell 命令并返回输出。
-    """
-    try:
-        result = subprocess.run(
-            command, 
-            shell=True,           # 允许通过 Shell 解释执行完整命令
-            capture_output=True,  # 截获标准输出和标准错误，供程序读取而非打到屏幕
-            text=True,            # 输出自动转为字符串，非 bytes
-            errors="replace",     # 遇到特殊编码字符用 ? 替换，防止报错崩溃
-            timeout=10,           # 设置 10 秒超时拦截，防止死循环命令卡死后台
-        )
-        output = result.stdout
-        if result.returncode != 0:
-            output += f"\n[错误] {result.stderr}"
-        return output or "(无输出)"
-    except subprocess.TimeoutExpired:
-        return "[错误] 命令执行超时（10秒）"
-    except OSError as e:
-        return f"[错误] 无法执行命令 ({e})"
-
-
-# 高危命令的特征：删除文件、提权、直写磁盘
-DANGEROUS_PATTERNS = [
-    r"\brm\b",          # 删除文件/目录指令 (如 rm -rf)
-    r"\bsudo\b",        # 提权执行指令
-    r"\bdd\b",          # 底层磁盘/块设备直接写指令
-    r"\bmkfs\w*\b",     # 格式化文件系统指令 (如 mkfs, mkfs.ext4)
-]
-
-# 白名单：严格认可的保守只读命令列表
-READONLY_COMMANDS = {"ls", "cat", "head", "tail", "grep", "wc", "pwd"}
-# Shell 元字符：涉及管道 |、重定向 >/calc<、串联 ;/&&、环境变量/命令替换 $()`\n 的一律拒绝判定为只读
-SHELL_META = re.compile(r"[;&|<>`$\n]")
-
-def is_readonly_command(command: str) -> bool:
-    """
-    保守地判断命令是否只读：必须是白名单里的单条命令，不带任何 shell 元字符。
-    """
-    if SHELL_META.search(command):  # 1. 发现任何管道、重定向、分号组合拳，直接返回 False
-        return False
-    try:    # 2. 使用 shlex 展开词法分析（处理空格与引号路径），提取第一个 Token 主命令
-        tokens = shlex.split(command)
-    except ValueError:
-        return False
-    # 3. 校验主命令是否在只读白名单内
-    return bool(tokens) and tokens[0] in READONLY_COMMANDS
-
-def run_command_self_check(args: dict):
-    """
-    run_command 专属安全拦截器：扫一遍命令，命中高危特征则返回 "ask" 要求用户手动审批。
-    """
-    command = args.get("command", "")
-    if any(re.search(pattern, command) for pattern in DANGEROUS_PATTERNS):
-        return "ask"
-    if is_readonly_command(command):
-        return "allow"
-    # 没命中高危特征，交给通用规则决定
-    return None
-
-#【注册表模式 (Registry Pattern)】在 Python 里，函数也是一种数据类型，
-# 把 run_command_self_check 函数作为回调引用，注册到 permissions 模块的 "run_command" key下。
-# 当权限引擎校验 run_command 工具时，会自动查表并触发此回调函数。
-permissions.register_self_check("run_command", run_command_self_check)
-# permissions.register_self_check(run_command.__name__, run_command_self_check)
-
-# Pydantic AI 支持 tools=[plain_function]，从函数签名 + docstring 自动生成 JSON Schema
-# edit_file 和 write_file 标记 sequential=True：同一轮里的多个改文件调用必须串行执行，
-# 否则它们会基于同一份旧快照并发写盘、互相覆盖（这正是 readFileState + mtime 想防住的并发问题）
-TOOLS = [
-    read_file,
-    Tool(edit_file, sequential=True),
-    Tool(write_file, sequential=True),
-    run_command,
-]
