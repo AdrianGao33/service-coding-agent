@@ -18,7 +18,7 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
 
 
-# 三种权限模式: default / acceptEdits / bypass
+# 四种权限模式: default / acceptEdits / bypass / auto
 # default 模式：读行，写、跑命令需审批
 DEFAULT = "default"
 # acceptEdits 模式：读写都行，跑命令需审批
@@ -33,7 +33,8 @@ MODES = [DEFAULT, ACCEPT_EDITS, AUTO, BYPASS]
 
 # 只读工具表：无破坏力，任何模式下都直接放行
 # ask_user_question 工具本身就是问用户，再过审批就套娃，和 read_file 同等放行
-READONLY_TOOLS = {"read_file", "ask_user_question"}
+# task_* 工具只触碰 ~/.my-code-agent/tasks/ 下的私有数据目录，不影响用户工程目录和系统状态，按只读工具放行不弹审批
+READONLY_TOOLS = {"read_file", "ask_user_question", "task_create", "task_list", "task_get", "task_update"}
 # 编辑文件类工具表，acceptEdits 模式下自动放行
 EDIT_TOOLS = {"write_file", "edit_file"}
 

@@ -11,6 +11,7 @@ ui/input_ui.py - 终端常驻交互式输入组件 (REPL UI)
 import asyncio
 import re
 import time
+from html import escape as html_escape
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
@@ -35,6 +36,13 @@ from .render import console
 
 # working 指示器的转圈动画帧
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+# task 面板每行的渲染模板，键是 task.status，值里的 {s} 是 escape 后的 subject
+_TASK_ROW_TEMPLATES = {
+    "completed": "  <ansigreen>✔</ansigreen> <s><ansibrightblack>{s}</ansibrightblack></s>",
+    "in_progress": "  <ansiyellow>▶</ansiyellow> <b>{s}</b>",
+    "pending": "  <ansibrightblack>☐ {s}</ansibrightblack>",
+}
 
 
 class AtFileCompleter(Completer):
@@ -79,6 +87,14 @@ class Repl:
     def _prompt_prefix(self, line_number, wrap_count):
         return HTML("<ansicyan>❯ </ansicyan>")
 
+    def _task_lines(self):
+        # 每次 spinner tick (~100ms) 都会调到这里，store 已经把 list() 做成内存命中，所以贴着改贴着画也不肉痛
+        tasks = self.state.tasks_store.list()
+        if not tasks:
+            return HTML("")
+        rows = [_TASK_ROW_TEMPLATES[t.status].format(s=html_escape(t.subject)) for t in tasks]
+        return HTML("\n".join(rows))
+
     def _working_line(self):
         # 输入框上方那行：转圈帧 + 已耗时 + 打断提示，只在请求期间显示
         frame = _SPINNER[self._frame % len(_SPINNER)]
@@ -95,12 +111,22 @@ class Repl:
         return Window(height=1, char="─", style="fg:ansibrightblack")
 
     def _build_app(self):
-        # 从上到下：working 指示器、分割线、输入行、分割线、模式行
+        # 从上到下：working 指示器（请求中才显示）、task 面板（有 task 才显示）、分割线、输入行、分割线、模式行
         body = HSplit(
             [
+                # working 指示器排在最上面，task 面板紧贴它下方，整组贴着输入框上方分割线
                 ConditionalContainer(
                     Window(FormattedTextControl(self._working_line), height=1),
                     filter=Condition(lambda: self.working),
+                ),
+                # task 面板按内容自适应高度，列表空时 ConditionalContainer 直接塌成 0 行不占地方，不需要手动开关
+                ConditionalContainer(
+                    Window(
+                        FormattedTextControl(self._task_lines),
+                        height=Dimension(min=0),
+                        dont_extend_height=True,
+                    ),
+                    filter=Condition(lambda: len(self.state.tasks_store.list()) > 0),
                 ),
                 self._divider(),
                 # 输入行只占内容高度，多行自动换行撑开

@@ -13,6 +13,7 @@ from . import shell as _shell  # noqa: F401
 from .ask_user import ask_user_question
 from .file import read_and_register, read_file, edit_file, write_file
 from .shell import run_command
+from .tasks import task_create, task_get, task_list, task_update
 
 # Pydantic AI 支持 tools=[plain_function]，从函数签名 + docstring 自动生成 JSON Schema
 # edit_file 和 write_file 标记 sequential=True：同一轮里的多个改文件调用必须串行执行，
@@ -23,6 +24,10 @@ TOOLS = [
     Tool(edit_file, sequential=True),
     Tool(write_file, sequential=True),
     run_command,
+    task_create,
+    task_list,
+    task_get,
+    Tool(task_update, sequential=True),
     ask_user_question,
 ]
 

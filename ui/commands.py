@@ -20,6 +20,7 @@ from rich.padding import Padding
 import permissions
 import session
 from agent import ReadFileState
+from tasks_store import TasksStore
 from .render import console, print_step, print_welcome_banner
 
 
@@ -44,12 +45,14 @@ class SessionState:
     跨命令与主循环共享的会话状态类（主循环实例化后作为参数传给各个命令）
     """
     history: list = field(default_factory=list)         # 全量上下文消息历史
-    input_tokens: int = 0                               # 本 Session 累计消耗的 input token
-    output_tokens: int = 0                              # 本 Session 累计消耗的 output token
+    input_tokens: int = 0                               # 本session流入大模型的token累积量
+    output_tokens: int = 0                              # 本session大模型输出的token累积量
     model_name: str = ""
     session_id: str = ""                                # 当前会话 ID（决定写入哪个 jsonl 文件）  
     last_api_calls: list = field(default_factory=list)  # 最近一轮对话触发的 API 调用日志
     read_file_state: ReadFileState = field(default_factory=ReadFileState)  # 本会话的 readFileState，注入给文件工具；切换会话时换上新实例
+    # 本会话的 TasksStore，注入给 task 工具；落盘在 ~/.my-code-agent/tasks/<session_id>/，所以必须由 main 显式构造传入
+    tasks_store: TasksStore | None = None
 
 def _truncate(text, limit: int = 120) -> str:
     """
@@ -237,6 +240,7 @@ def cmd_new(state: SessionState) -> bool:
     state.session_id = session.new_session_id()
     permissions.state.session_allowed.clear()
     state.read_file_state = ReadFileState()
+    state.tasks_store = TasksStore(session_id=state.session_id)
     console.print("已开启新会话\n")
     return True
 
@@ -283,6 +287,8 @@ async def cmd_resume(state: SessionState) -> bool:
     permissions.state.session_allowed.clear()
     # readFileState 也是会话级的，切换会话后换上新实例。恢复的历史里虽有读取痕迹，但进程退出后文件可能已变、mtime 不再可信，让模型恢复后首次编辑重读一次更稳
     state.read_file_state = ReadFileState()
+    # TasksStore 指向当前 session_id 的目录，恢复时直接接上旧 task 列表（每个 task 是独立 JSON，已经落盘）
+    state.tasks_store = TasksStore(session_id=state.session_id)
 
     # 2. 重新累加盘存历史 Token 消耗
     # jsonl 里每条模型回复都带 usage，把会话的 token 用量累加回来

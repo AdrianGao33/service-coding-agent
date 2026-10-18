@@ -18,7 +18,7 @@ from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_core import to_jsonable_python
 
 # 所有会话记录的根目录
-STORAGE_ROOT = Path.home() / ".adrian-code-agent" / "projects"
+STORAGE_ROOT = Path.home() / ".my-code-agent" / "projects"
 
 
 def sanitize_path(path: str) -> str:

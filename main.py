@@ -19,6 +19,10 @@ import session
 # 从本地 agent 模块导入单例 agent 实例、模型名称、 API 调用日志缓存
 from agent import agent, MODEL_NAME, api_call_log
 
+from agent.deps import AgentDeps
+
+from tasks_store import TasksStore
+
 # 本地UI文件夹 命令模块导入相关命令映射、状态类及渲染工具函数
 from ui.commands import (
     COMMANDS,
@@ -92,9 +96,16 @@ async def run_agent_loop(user_input, state):
     实现“边思考、边调工具、边实时输出”的流式效果。
     """
     api_call_log.clear() # 每轮新对话发起前，清空全局 API 调用日志 Buffer（只记上次调用）
+
+   # deps 把本会话的 readFileState 和 tasksStore 一起打包成 AgentDeps 注入工具层，工具内通过 ctx.deps.* 访问
+    deps = AgentDeps(
+        read_file_state=state.read_file_state,
+        tasks_store=state.tasks_store,
+    )
  
     # 开启 Agent 图迭代器上下文，传入当前输入 + 全量历史上下文 (state.history)
-    async with agent.iter(user_input, message_history=state.history, deps=state.read_file_state) as run: #iter是个异步的可迭代对象里面是多个节点（大模型请求和工具调用）
+    async with agent.iter(user_input, message_history=state.history, deps=deps
+    ) as run: #iter是个异步的可迭代对象里面是多个节点（大模型请求和工具调用）
         node = run.next_node
         
         # 只要当前节点不是终点 End，就一直在图状态机里往下走
@@ -115,9 +126,13 @@ async def run_agent_loop(user_input, state):
 
 
 async def main():
+    session_id = session.new_session_id()
+    # 本会话的 TasksStore 落盘在 ~/.my-claude-code/tasks/<session_id>/，会话级隔离
+    tasks_store = TasksStore(session_id=session_id)
     state = SessionState(
         model_name=MODEL_NAME,
-        session_id=session.new_session_id(),
+        session_id=session_id,
+        tasks_store=tasks_store,
     )
     print_welcome_banner("my-claude-code")
 

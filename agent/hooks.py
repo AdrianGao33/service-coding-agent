@@ -16,16 +16,25 @@ from typing import Any
 # 从 pydantic_ai 中导入生命周期 Hook 管理类[cite: 3]
 from pydantic_ai.capabilities import Hooks
 from pydantic_ai.exceptions import ModelHTTPError, ModelAPIError
-from pydantic_ai.messages import ModelRequest, UserPromptPart
+from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, UserPromptPart
 
 import classifier
 import permissions
 from ui.render import console, print_step
 
-from .file_state import ReadFileState
-from .reminders import build_reminder_text
+from .deps import AgentDeps
+from .reminders import build_file_reminder_text, build_task_reminder_text
 
 MAX_RETRIES = 3
+
+# task_reminder 触发阈值
+# 模型连续几轮没用 task 工具才考虑提醒
+TASK_REMINDER_TURNS_SINCE_WRITE = 6
+# 两次 task 提醒之间至少间隔几轮，防止刷屏
+TASK_REMINDER_TURNS_BETWEEN = 4
+
+# 哪些工具算"task 管理动作"——调过它们就重置 since_write 计数
+_TASK_MANAGEMENT_TOOLS = {"task_create", "task_update"}
 
 @dataclass
 class ApiCall:
@@ -93,21 +102,93 @@ async def _record_response(ctx, request_context, response):
 # ------------------------------------------------------------------------------
 # 2. system-reminder 注入
 # ------------------------------------------------------------------------------
-"""每次发送 API 请求前，校验账本并动态追加 system-reminder。"""
+
+def _scan_task_turn_counters(messages) -> tuple[int, int]:
+    """
+    反向扫描对话历史，一次性算出：
+    1. since_mgmt: 模型已经连续几轮没调过 task_create / task_update 了
+    2. since_reminder: 系统已经连续几轮没给模型发过 Task 提醒了
+    """
+    since_mgmt = 0
+    since_reminder = 0
+    found_mgmt = False
+    found_reminder = False
+    # 倒序遍历每一个 message（从最新到最老）
+    for msg in reversed(messages):          
+
+        if isinstance(msg, ModelResponse):  
+            if not found_mgmt:
+                # 【内层小循环 A】：用来找这一条 ModelResponse 里有没有 task 工具
+                for part in msg.parts:
+                    if isinstance(part, ToolCallPart) and part.tool_name in _TASK_MANAGEMENT_TOOLS:
+                        found_mgmt = True
+                        break   # break from loop A
+
+                if not found_mgmt:
+                    since_mgmt += 1
+            if not found_reminder:
+                since_reminder += 1
+
+        # 扫描发送给模型的请求，找有没有包含过 task 提醒文案        
+        elif isinstance(msg, ModelRequest) and not found_reminder:
+            # 【内层小循环 B】：用来找这一条 ModelRequest 里有没有提醒文案
+            for part in msg.parts:
+                if isinstance(part, UserPromptPart) and isinstance(part.content, str) and _REMINDER_SENTINELS["task"] in part.content:
+                    found_reminder = True
+                    break   # break from loop B
+
+        # 两个计数点都找到了，直接退出循环，不浪费CPU遍历更老的历史
+        if found_mgmt and found_reminder:
+            break
+    return since_mgmt, since_reminder
+
+
+def _build_file_reminder(ctx, messages) -> str | None:
+    """过期文件提醒构建器：检测 ReadFileState 账本是否有文件被外部改过"""
+    return build_file_reminder_text(ctx.deps.read_file_state)
+
+
+def _build_task_reminder(ctx, messages) -> str | None:
+    """Task 提醒构建器：只有在沉默轮数和上次提醒间隔均满足冷却阈值时才触发"""
+    since_mgmt, since_reminder = _scan_task_turn_counters(messages)
+    # 1. 距离上次用 task 工具还不够久，不提醒
+    if since_mgmt < TASK_REMINDER_TURNS_SINCE_WRITE:
+        return None
+    # 2. 距离上次发 task 提醒还不够久（还在冷却期），不提醒
+    if since_reminder < TASK_REMINDER_TURNS_BETWEEN:
+        return None
+    return build_task_reminder_text(ctx.deps.tasks_store)
+
+
+# 注册要在 before_model_request 触发的 reminder builder：每条 (sentinel, builder)，sentinel 仅用于回扫识别（task reminder 复用）
+_REMINDER_SENTINELS = {
+    # task reminder 的识别串就是它正文里 builder 必定带的那句话，不再单独嵌一个 marker
+    "task": "task 工具最近没有被使用",
+}
+_REMINDER_BUILDERS = (_build_file_reminder, _build_task_reminder)
+
+
 @hooks.on.before_model_request
 async def _inject_reminders(ctx, request_context):
     """
-    每次 model 请求前，readFileState 里有被外部改过的文件就追加一条 system-reminder；模型重读后 record() 刷新 timestamp，下次 hook 自然不再注入。
+    合并触发提醒
+    依次跑每个注册过的 reminder builder：返回非 None 的就拼到 request_context.messages 末尾。
+    当前两条：过期文件提醒（看 readFileState）+ task 提醒（看 turn 计数 + tasks_store）。
+    要加第 3 种 reminder 时只需多写一个 builder，不必再复制一次 hook 框架。
     """
-    state: ReadFileState = ctx.deps
-    text = build_reminder_text(state)                                   # 1. 调用 reminders.py 构建提醒文本（无过时文件则返回 None）
-    if text is None:
-        return request_context                                          # 2. 无过时文件，原封不动放行
-
-    reminder = ModelRequest(parts=[UserPromptPart(content=text)])       # 3. 被改动：构造包含 <system-reminder> XML 的 UserPromptPart 消息
-    new_messages = list(request_context.messages) + [reminder]          # 4. 拼接至当前请求的上下文消息列表末尾
-    print_step("[dim]◇ system[/]", f"[dim]{text[:200]}[/]")             # 5. 终端回显调优日志 (截取前 200 字符)
-    return dataclasses.replace(request_context, messages=new_messages)  # 6. 使用 dataclasses.replace 生成全新的 request_context 实例并返回
+    messages = list(request_context.messages)
+    appended = []
+    for builder in _REMINDER_BUILDERS:
+        text = builder(ctx, messages + appended)
+        if text is None:
+            continue
+        appended.append(ModelRequest(parts=[UserPromptPart(content=text)]))
+        print_step("[dim]◇ system[/]", f"[dim]{text[:200]}[/]")
+    # 如果没有任何提醒需要追加，原封不动放行
+    if not appended:
+        return request_context
+    # 将所有生成的新提醒追加到消息列表末尾，返回更新后的 request_context
+    return dataclasses.replace(request_context, messages=messages + appended)
 
 # ------------------------------------------------------------------------------
 # 3. API 请求网络指数退避重试
