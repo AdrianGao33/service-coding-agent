@@ -131,14 +131,14 @@ async def main():
     session_id = session.new_session_id()
     # 启动时建好记忆目录，system prompt 里承诺过「目录已存在」，模型就不必浪费回合去确认
     store.ensure_memory_dir()
-    # 本会话的 TasksStore 落盘在 ~/.my-claude-code/tasks/<session_id>/，会话级隔离
+    # 本会话的 TasksStore 落盘在 ~/.my-code-agent/tasks/<session_id>/，会话级隔离
     tasks_store = TasksStore(session_id=session_id)
     state = SessionState(
         model_name=MODEL_NAME,
         session_id=session_id,
         tasks_store=tasks_store,
     )
-    print_welcome_banner("my-claude-code")
+    print_welcome_banner("my-code-agent")
 
     # 常驻输入区：输入框整个会话期间不消失
     repl = Repl(state)
