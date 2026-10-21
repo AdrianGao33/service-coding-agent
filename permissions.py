@@ -17,6 +17,7 @@ from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
 
+from memory import store
 
 # 四种权限模式: default / acceptEdits / bypass / auto
 # default 模式：读行，写、跑命令需审批
@@ -84,7 +85,10 @@ def compute_decision(tool_name: str, args: dict) -> str:
     # 4. 只读工具：任何模式都自动放行
     if tool_name in READONLY_TOOLS:
         return "allow"
-    # 5. Fast Path (快速通道)：acceptEdits 与 auto 模式下，写文件直接规则放行，无需发起 classifier 请求
+    # 5. 写记忆目录自动放行：那是 agent 自己的数据目录，不碰用户工程和系统状态，弹审批只会打断记忆的自动积累
+    if tool_name in EDIT_TOOLS and store.is_memory_path(str(args.get("path", ""))):
+        return "allow"
+    # 6. Fast Path (快速通道)：acceptEdits 与 auto 模式下，写文件直接规则放行，无需发起 classifier 请求
     # 假设一个构建代码的情景，需要write_file多次，频繁弹窗审批会让用户烦躁，独立auto大模型需要发起多次请求，增加延迟和成本
     if state.mode in (ACCEPT_EDITS, AUTO) and tool_name in EDIT_TOOLS:
         return "allow"

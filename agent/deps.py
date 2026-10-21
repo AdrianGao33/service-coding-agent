@@ -20,4 +20,5 @@ from .file_state import ReadFileState
 @dataclass
 class AgentDeps:
     read_file_state: ReadFileState
-    tasks_store: TasksStore
+    # 后台记忆 agent 的 fork 只挂文件工具，不需要 tasksStore，允许为 None
+    tasks_store: TasksStore | None

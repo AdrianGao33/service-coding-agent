@@ -81,14 +81,22 @@ def load_history(session_id: str) -> list:
 
 def first_prompt(path: Path) -> str:
     """
-    只读文件第一行，提取首条用户输入作为这个会话的摘要。
+    从文件开头找到首条真正的用户输入，作为这个会话的摘要。
+    召回的记忆、@ 引用可能排在它前面，所以要跳过 system-reminder 内容，必要时多读几行。
     """
     with open(path, encoding="utf-8") as f:
-        head = f.readline() # 极速读取第一行，无需加载整个文件
-    msg = json.loads(head)
-    for part in msg.get("parts", []):
-        if part.get("part_kind") == "user-prompt":
-            return str(part.get("content", ""))
+        for _ in range(20):
+            line = f.readline()
+            if not line:
+                break
+            msg = json.loads(line)
+            for part in msg.get("parts", []):
+                if part.get("part_kind") != "user-prompt":
+                    continue
+                content = str(part.get("content", ""))
+                if content.startswith("<system-reminder>"):
+                    continue
+                return content
     return "(空会话)"
 
 # 提供菜单

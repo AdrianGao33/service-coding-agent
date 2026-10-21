@@ -20,6 +20,7 @@ from rich.padding import Padding
 import permissions
 import session
 from agent import ReadFileState
+from memory import background, store
 from tasks_store import TasksStore
 from .render import console, print_step, print_welcome_banner
 
@@ -53,6 +54,8 @@ class SessionState:
     read_file_state: ReadFileState = field(default_factory=ReadFileState)  # 本会话的 readFileState，注入给文件工具；切换会话时换上新实例
     # 本会话的 TasksStore，注入给 task 工具；落盘在 ~/.my-code-agent/tasks/<session_id>/，所以必须由 main 显式构造传入
     tasks_store: TasksStore | None = None
+    # 本会话已召回注入过的记忆文件名，同一条记忆不重复注入
+    surfaced_memories: set = field(default_factory=set)
 
 def _truncate(text, limit: int = 120) -> str:
     """
@@ -241,6 +244,7 @@ def cmd_new(state: SessionState) -> bool:
     permissions.state.session_allowed.clear()
     state.read_file_state = ReadFileState()
     state.tasks_store = TasksStore(session_id=state.session_id)
+    state.surfaced_memories = set()
     console.print("已开启新会话\n")
     return True
 
@@ -289,6 +293,8 @@ async def cmd_resume(state: SessionState) -> bool:
     state.read_file_state = ReadFileState()
     # TasksStore 指向当前 session_id 的目录，恢复时直接接上旧 task 列表（每个 task 是独立 JSON，已经落盘）
     state.tasks_store = TasksStore(session_id=state.session_id)
+    # 召回去重集合从空集重新开始：恢复的历史里已注入的记忆可能被再召回一次，重复一次无伤大雅
+    state.surfaced_memories = set()
 
     # 2. 重新累加盘存历史 Token 消耗
     # jsonl 里每条模型回复都带 usage，把会话的 token 用量累加回来
@@ -318,6 +324,38 @@ def cmd_status(state: SessionState) -> bool:
     console.print(f"累计输出 tokens：{state.output_tokens}\n")
     return True
 
+def cmd_memory(state: SessionState) -> bool:
+    """
+    显示记忆目录、所有记忆文件和 MEMORY.md 索引。
+    """
+    console.print(f"记忆目录：{store.memory_dir()}\n")
+    headers = store.scan_memory_files()
+    if not headers:
+        console.print("(还没有任何记忆，记忆会随对话逐渐积累)\n")
+        return True
+    for h in headers:
+        age = store.age_text(store.age_days(h.mtime))
+        console.print(escape(f"  [{h.type or '?'}] {h.filename}（{age}）"))
+        console.print(f"      [dim]{escape(h.description)}[/]")
+    console.print()
+    index = store.read_index()
+    if index:
+        console.print("MEMORY.md 索引：")
+        console.print(Padding(Markdown(index), (0, 0, 0, 2)))
+        console.print()
+    return True
+
+async def cmd_dream(state: SessionState) -> bool:
+    """
+    手动触发记忆合并整理，跳过自动闸门，方便立刻看到效果。
+    """
+    console.print("开始整理记忆，可能需要一会儿...\n")
+    try:
+        await background.dream(list(state.history), force=True, session_id=state.session_id)
+    except Exception as e:
+        console.print(f"[red]整理失败：{type(e).__name__}: {e}[/]\n")
+    console.print()
+    return True
 
 def cmd_api_detail(state: SessionState) -> bool:
     """
@@ -351,6 +389,8 @@ COMMANDS = {
     "new": Command("new", "开启新会话", cmd_new),
     "resume": Command("resume", "恢复历史会话", cmd_resume),
     "status": Command("status", "显示当前会话状态", cmd_status),
+    "memory": Command("memory", "查看长期记忆", cmd_memory),
+    "dream": Command("dream", "立即整理合并长期记忆", cmd_dream),
     "api-detail": Command("api-detail", "显示最近一轮 model API 调用详情", cmd_api_detail),
     "help": Command("help", "显示可用命令", cmd_help),
     "exit": Command("exit", "退出程序", cmd_exit),

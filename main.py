@@ -21,6 +21,8 @@ from agent import agent, MODEL_NAME, api_call_log
 
 from agent.deps import AgentDeps
 
+from memory import background, recall, store
+
 from tasks_store import TasksStore
 
 # 本地UI文件夹 命令模块导入相关命令映射、状态类及渲染工具函数
@@ -123,10 +125,12 @@ async def run_agent_loop(user_input, state):
                         print_part(part)                # 实时将“工具在本地执行返回的结果”渲染到终端
 
     apply_result(state, run.result)         # 当循环遇到 End 节点退出后，run.result 会自动结算出最终的 AgentRunResult
-
+    return run.result                       # 把本轮结果交回给调用方，后台记忆提炼要用本轮新增的消息判断该不该跑
 
 async def main():
     session_id = session.new_session_id()
+    # 启动时建好记忆目录，system prompt 里承诺过「目录已存在」，模型就不必浪费回合去确认
+    store.ensure_memory_dir()
     # 本会话的 TasksStore 落盘在 ~/.my-claude-code/tasks/<session_id>/，会话级隔离
     tasks_store = TasksStore(session_id=session_id)
     state = SessionState(
@@ -157,11 +161,20 @@ async def main():
         # 2. 切换 UI 为工作状态（显示思考中动画/指示器）
         repl.start_working()
 
+        # 召回相关记忆塞进历史，模型带着过去积累的经验处理本轮输入
+        await recall.inject_memories(user_input, state)
+
         # 3. 驱动 Agent 图状态机开始思考与执行
-        await run_agent_loop(user_input, state)
+        result = await run_agent_loop(user_input, state)
+
+        # 本轮结束后由后台提炼记忆，并顺带检查是否到了该定期合并的时候
+        background.schedule(state, result.new_messages())
 
     # 启动 Repl 事件循环，等待用户敲击回车唤起 on_submit
     await repl.run(on_submit)
+
+    # 退出前给后台记忆任务留收尾时间，提炼写到一半被杀会留下半截记忆
+    await background.drain()
 
 if __name__ == "__main__":
     try:
