@@ -26,7 +26,6 @@ def sanitize_path(path: str) -> str:
     把项目绝对路径转码成合法的目录名：非字母数字字符一律换成 -
     例如：'/Users/adrian/code' -> '-Users-adrian-code'
     """
-
     return re.sub(r"[^a-zA-Z0-9]", "-", path) # 用法: re.sub(pattern, replacement, string)
 
 
@@ -64,6 +63,18 @@ def append_messages(session_id: str, messages) -> None:
             # 1. to_jsonable_python: 将 PydanticAI 对象转为干净的 Python dict/list
             # 2. json.dumps: 转为 JSON 字符串，ensure_ascii=False 保持中文原样展示
             # 3. 追加换行符 \n 形成标准 JSONL 格式
+            f.write(json.dumps(to_jsonable_python(msg), ensure_ascii=False) + "\n")
+
+
+def rewrite_messages(session_id: str, messages) -> None:
+    """
+    用内存里的对话历史整体重写会话文件，/rewind 截断对话后用它落盘。
+    全量重写以内存为准，不依赖磁盘行数和内存条目一一对应。
+    """
+    path = session_file(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for msg in messages:
             f.write(json.dumps(to_jsonable_python(msg), ensure_ascii=False) + "\n")
 
 

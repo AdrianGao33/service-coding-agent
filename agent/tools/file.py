@@ -148,7 +148,11 @@ def edit_file(ctx: RunContext[AgentDeps], path: str, old_string: str, new_string
     else:
         updated = content.replace(old_string, new_string, 1) # 如果多个有重复，只替换遇见的第一个
 
-    # 7. 整体写回磁盘，再用新内容和新 mtime 刷新登记
+    # 7. 写盘之前把改动前的内容备份进文件检查点，/rewind 才有得恢复
+    if ctx.deps.file_history:
+        ctx.deps.file_history.track_edit(path)
+
+    # 8. 整体写回磁盘，再用新内容和新 mtime 刷新登记
     with open(path, "w", encoding="utf-8") as f:
         f.write(updated)
     state.record(path, updated)
@@ -168,6 +172,9 @@ def write_file(ctx: RunContext[AgentDeps], path: str, content: str) -> str:
             raise ModelRetry(f"{path} 已存在，覆盖前请先用 read_file 读一遍，确认不会误删内容")
         if os.path.getmtime(path) > record["timestamp"]:
             raise ModelRetry(f"{path} 在你读取之后被改动过，请重新 read_file 再覆盖")
+    # 写盘之前把改动前的状态备份进文件检查点
+    if ctx.deps.file_history:
+        ctx.deps.file_history.track_edit(path)
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)

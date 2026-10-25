@@ -9,20 +9,14 @@
 5. 引用文件预处理：@文件，预读，更新session的read_file_state
 """
 import asyncio # Python 标准异步库，支持 async/await 协程语法
-
 from pydantic_ai import Agent # End 是 PydanticAI 图状态机的终点节点。每个模型请求/工具调用都是一个 Node，遇到 End 循环终止
-
 from pydantic_graph import End
 
 import session
-
-# 从本地 agent 模块导入单例 agent 实例、模型名称、 API 调用日志缓存
 from agent import agent, MODEL_NAME, api_call_log
-
 from agent.deps import AgentDeps
-
+from file_history import FileHistory
 from memory import background, recall, store
-
 from tasks_store import TasksStore
 
 # 本地UI文件夹 命令模块导入相关命令映射、状态类及渲染工具函数
@@ -33,7 +27,6 @@ from ui.commands import (
     print_part,
     print_welcome_banner,
 )
-
 # 导入手搓的终端常驻交互式输入组件 Repl
 from ui.input_ui import Repl
 from mentions import build_mention_messages, extract_at_mentions
@@ -103,6 +96,7 @@ async def run_agent_loop(user_input, state):
     deps = AgentDeps(
         read_file_state=state.read_file_state,
         tasks_store=state.tasks_store,
+        file_history=state.file_history,
     )
  
     # 开启 Agent 图迭代器上下文，传入当前输入 + 全量历史上下文 (state.history)
@@ -137,6 +131,7 @@ async def main():
         model_name=MODEL_NAME,
         session_id=session_id,
         tasks_store=tasks_store,
+        file_history=FileHistory(session_id=session_id),
     )
     print_welcome_banner("my-code-agent")
 
@@ -154,6 +149,9 @@ async def main():
             return
         if action == "continue":
             return
+
+        # 建检查点：此刻 @ 引用和记忆召回还没注入，len(history) 就是干净的回退下标
+        state.file_history.make_checkpoint(len(state.history), user_input)
 
         # 解析 @ 引用，把被引用的文件伪装成 read_file 调用塞进历史
         inject_at_mentions(user_input, state)
