@@ -12,6 +12,7 @@ import asyncio # Python 标准异步库，支持 async/await 协程语法
 from pydantic_ai import Agent # End 是 PydanticAI 图状态机的终点节点。每个模型请求/工具调用都是一个 Node，遇到 End 循环终止
 from pydantic_graph import End
 
+import compact
 import session
 from agent import agent, MODEL_NAME, api_call_log
 from agent.deps import AgentDeps
@@ -40,12 +41,16 @@ async def handle_command(user_input, state) -> str:
     """
     if not user_input.startswith("/"):
         return "pass"
-    cmd_name = user_input[1:].split()[0]
+    cmd_name, _, args = user_input[1:].partition(" ")
     command = COMMANDS.get(cmd_name)
     if command is None:
         console.print(f"未知命令：/{cmd_name}，输入 /help 查看可用命令\n")
         return "continue"
-    result = command.handler(state) #这边才执行
+    # 声明接收参数的命令（如 /compact），把命令名后面的整段文本传给它
+    if command.takes_args:
+        result = command.handler(state, args.strip())
+    else:
+        result = command.handler(state)
     # 个别命令（如 /resume）要弹交互式列表，是异步函数，会返回一个coroutine，跑起来前面需要加 await
     if asyncio.iscoroutine(result): 
         result = await result
@@ -149,6 +154,9 @@ async def main():
             return
         if action == "continue":
             return
+
+        # 发请求前检查上下文水位，越过阈值就先自动压缩再继续
+        await compact.auto_compact_if_needed(state)
 
         # 建检查点：此刻 @ 引用和记忆召回还没注入，len(history) 就是干净的回退下标
         state.file_history.make_checkpoint(len(state.history), user_input)

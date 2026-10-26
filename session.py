@@ -8,6 +8,7 @@
 """
 import json #json.dumps转换: dict -> json / json.loads转换: json -> dict
 import re
+import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -77,6 +78,17 @@ def rewrite_messages(session_id: str, messages) -> None:
         for msg in messages:
             f.write(json.dumps(to_jsonable_python(msg), ensure_ascii=False) + "\n")
 
+def archive_session(session_id: str) -> Path:
+    """
+    压缩重写会话文件之前先存档：把当前会话文件拷贝进 compact-history/ 子目录，返回存档路径。
+    存档保留了压缩前的完整对话记录，摘要不够用时模型可以回头读它。
+    放子目录是为了避开 list_sessions() 的 *.jsonl 扫描，存档不会出现在 /resume 列表里。
+    """
+    archive_dir = project_dir() / "compact-history"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    path = archive_dir / f"{session_id}-{datetime.now():%Y%m%d-%H%M%S}.jsonl"
+    shutil.copy2(session_file(session_id), path)
+    return path
 
 def load_history(session_id: str) -> list:
     """

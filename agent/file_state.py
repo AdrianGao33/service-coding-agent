@@ -37,6 +37,12 @@ class ReadFileState:
         """
         return self._state.get(os.path.abspath(path))
 
+    def paths(self) -> list[str]:
+        """
+        所有登记过的绝对路径，按首次读取顺序排列。
+        """
+        return list(self._state)
+
     def stale_paths(self) -> list[str]:
         """
         返回磁盘 mtime 比登记的读取时间更新的文件的绝对路径——

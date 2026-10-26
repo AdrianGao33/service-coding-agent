@@ -24,6 +24,7 @@ from rich.markdown import Heading, Markdown
 from rich.markup import escape
 from rich.padding import Padding
 
+import compact
 import permissions
 import session
 from agent import ReadFileState
@@ -70,6 +71,8 @@ class SessionState:
     file_history: FileHistory | None = None
     # /rewind 回退对话后待回填输入框的原 prompt，Repl 在命令结束后消费
     pending_input: str = ""
+    # 自动压缩连续失败的次数，达到上限后不再重试
+    compact_failures: int = 0
 
 
 @dataclass
@@ -77,7 +80,9 @@ class Command:
     name: str
     description: str
     # handler 返回 False 表示主循环应当退出
-    handler: Callable[["SessionState"], bool]
+    handler: Callable[..., bool]
+    # 是否接收命令名后面的参数串（如 /compact 的补充指令）
+    takes_args: bool = False
 
 
 def _truncate(text, limit: int = 120) -> str:
@@ -258,6 +263,7 @@ def cmd_new(state: SessionState) -> bool:
     state.input_tokens = 0
     state.output_tokens = 0
     state.last_api_calls.clear()
+    state.compact_failures = 0
     state.session_id = session.new_session_id()
     # 权限白名单是会话级的，「本会话不再询问」不该带进新会话
     permissions.state.session_allowed.clear()
@@ -341,6 +347,7 @@ async def cmd_resume(state: SessionState) -> bool:
     _recount_tokens(state)
     # 最近一轮的 API 调用记录只在进程内有效，没法恢复，清空
     state.last_api_calls.clear()
+    state.compact_failures = 0
 
     # 把恢复的对话回放到屏幕上
     console.print(f"\n已恢复会话 {selected[:8]}，共 {len(state.history)} 条消息：\n")
@@ -565,6 +572,7 @@ async def cmd_rewind(state: SessionState) -> bool:
         _recount_tokens(state)
         state.last_api_calls.clear()
         state.surfaced_memories = set()
+        state.compact_failures = 0
     # 无论回退哪个通道，readFileState 登记的内容和 mtime 都已过期，必须清空，否则先读后写闸门会放行基于旧内容的编辑
     state.read_file_state = ReadFileState()
 
@@ -572,10 +580,27 @@ async def cmd_rewind(state: SessionState) -> bool:
     return True
 
 
+async def cmd_compact(state: SessionState, args: str = "") -> bool:
+    """
+    手动压缩上下文，可以带补充指令，如 /compact 重点保留文件改动。
+    """
+    try:
+        await compact.run_compact(state, custom_instructions=args)
+    except Exception as e:
+        console.print(f"[red]压缩失败：{type(e).__name__}: {e}[/]\n")
+    return True
+
+
 def cmd_status(state: SessionState) -> bool:
     console.print(f"模型：           {state.model_name}")
     console.print(f"权限模式：       {permissions.state.mode}")
     console.print(f"历史消息条数：    {len(state.history)}")
+    used = compact.context_tokens(state.history)
+    threshold = compact.compact_threshold()
+    if used:
+        console.print(f"当前上下文占用（估算）：{used:,} / {threshold:,} tokens（{used * 100 // threshold}%）")
+    else:
+        console.print(f"当前上下文占用（估算）：暂无数据（自动压缩阈值 {threshold:,} tokens）")
     console.print(f"累计输入 tokens：{state.input_tokens}")
     console.print(f"累计输出 tokens：{state.output_tokens}\n")
     return True
@@ -648,6 +673,7 @@ COMMANDS = {
     "new": Command("new", "开启新会话", cmd_new),
     "resume": Command("resume", "恢复历史会话", cmd_resume),
     "rewind": Command("rewind", "回退到之前的检查点", cmd_rewind),
+    "compact": Command("compact", "压缩上下文（可带补充指令）", cmd_compact, takes_args=True),
     "status": Command("status", "显示当前会话状态", cmd_status),
     "memory": Command("memory", "查看长期记忆", cmd_memory),
     "dream": Command("dream", "立即整理合并长期记忆", cmd_dream),
@@ -655,3 +681,4 @@ COMMANDS = {
     "help": Command("help", "显示可用命令", cmd_help),
     "exit": Command("exit", "退出程序", cmd_exit),
 }
+
