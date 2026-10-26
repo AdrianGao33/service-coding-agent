@@ -179,6 +179,24 @@ class Repl:
             else:
                 self._buffer.reset()
 
+        @kb.add("c-v")
+        def _(event):
+            try:
+                data = event.app.clipboard.get_data()
+                if getattr(data, "text", None):
+                    event.current_buffer.insert_text(data.text)
+            except Exception:
+                pass
+
+        @kb.add("s-insert")
+        def _(event):
+            try:
+                data = event.app.clipboard.get_data()
+                if getattr(data, "text", None):
+                    event.current_buffer.insert_text(data.text)
+            except Exception:
+                pass
+
         @kb.add("c-d")
         def _(event):
             # 空闲且输入为空时退出
