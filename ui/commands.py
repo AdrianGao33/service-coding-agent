@@ -1,11 +1,3 @@
-"""
-ui/commands.py - 终端 UI 渲染中心与斜杠系统命令处理
-
-职责：
-1. 重写 Rich 库渲染规则（将默认居中的 Markdown 标题修复为左对齐）。
-2. 消息 Part 格式化：给 Prompt、Thinking、Text、ToolCall 等节点配上颜色图标与美化缩进。
-3. 斜杠命令注册：实现 /new, /resume, /status, /api-detail, /help, /exit 命令的处理逻辑。
-"""
 import difflib
 import os
 import time
@@ -25,6 +17,7 @@ from rich.markup import escape
 from rich.padding import Padding
 
 import compact
+import mcp_servers
 import permissions
 import session
 from agent import ReadFileState
@@ -606,6 +599,29 @@ def cmd_status(state: SessionState) -> bool:
     return True
 
 
+def cmd_mcp(state: SessionState) -> bool:
+    """
+    显示所有已配置 MCP server 的连接状态和工具清单。
+    """
+    if not mcp_servers.RECORDS:
+        console.print(f"未配置任何 MCP server。可在项目根目录的 .mcp.json 或 {mcp_servers.USER_CONFIG} 中添加。\n")
+        return True
+    for record in mcp_servers.RECORDS:
+        server_id = getattr(record, "toolset_id", None) or getattr(getattr(record, "toolset", None), "id", "unknown")
+        console.print(f"[bold]{server_id}[/]  [dim]{escape(record.transport)}[/]")
+        if record.status == "connected":
+            if record.tool_names:
+                console.print(f"  [green]已连接[/]，{len(record.tool_names)} 个工具")
+                for name in record.tool_names:
+                    console.print(f"    - {name}")
+            else:
+                console.print("  [green]已连接[/]，工具将在实际调用时按需加载")
+        else:
+            console.print(f"  [red]连接失败[/]：{escape(record.error)}")
+        console.print()
+    return True
+
+
 def cmd_memory(state: SessionState) -> bool:
     """
     显示记忆目录、所有记忆文件和 MEMORY.md 索引。
@@ -675,10 +691,10 @@ COMMANDS = {
     "rewind": Command("rewind", "回退到之前的检查点", cmd_rewind),
     "compact": Command("compact", "压缩上下文（可带补充指令）", cmd_compact, takes_args=True),
     "status": Command("status", "显示当前会话状态", cmd_status),
+    "mcp": Command("mcp", "查看 MCP server 状态和工具", cmd_mcp),
     "memory": Command("memory", "查看长期记忆", cmd_memory),
     "dream": Command("dream", "立即整理合并长期记忆", cmd_dream),
     "api-detail": Command("api-detail", "显示最近一轮 model API 调用详情", cmd_api_detail),
     "help": Command("help", "显示可用命令", cmd_help),
     "exit": Command("exit", "退出程序", cmd_exit),
 }
-

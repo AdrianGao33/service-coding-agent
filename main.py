@@ -13,6 +13,7 @@ from pydantic_ai import Agent # End 是 PydanticAI 图状态机的终点节点�
 from pydantic_graph import End
 
 import compact
+import mcp_servers
 import session
 from agent import agent, MODEL_NAME, api_call_log
 from agent.deps import AgentDeps
@@ -104,8 +105,9 @@ async def run_agent_loop(user_input, state):
         file_history=state.file_history,
     )
  
-    # 开启 Agent 图迭代器上下文，传入当前输入 + 全量历史上下文 (state.history)
-    async with agent.iter(user_input, message_history=state.history, deps=deps
+    # 开启 Agent 图迭代器上下文，传入当前输入 + 全量历史上下文 (state.history) + mcp工具
+    async with agent.iter(user_input, message_history=state.history, deps=deps,
+                          toolsets=mcp_servers.active_toolsets(),
     ) as run: #iter是个异步的可迭代对象里面是多个节点（大模型请求和工具调用）
         node = run.next_node
         
@@ -139,6 +141,12 @@ async def main():
         file_history=FileHistory(session_id=session_id),
     )
     print_welcome_banner("my-code-agent")
+
+    # 转圈提示连接进度，否则冷启动拉包时用户会以为卡死了
+    with console.status("正在连接 MCP server..."):
+        mcp_summary = await mcp_servers.startup()
+    if mcp_summary:
+        console.print(mcp_summary + "\n")
 
     # 常驻输入区：输入框整个会话期间不消失
     repl = Repl(state)
@@ -181,6 +189,9 @@ async def main():
 
     # 退出前给后台记忆任务留收尾时间，提炼写到一半被杀会留下半截记忆
     await background.drain()
+
+    # todo
+    await mcp_servers.shutdown()
 
 if __name__ == "__main__":
     try:
