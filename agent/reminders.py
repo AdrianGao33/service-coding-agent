@@ -8,7 +8,11 @@ System Reminder 提示词构建器：环境状态感知与 Task 进度的 Prompt
 2. Task 状态提醒 (build_task_reminder_text)：
    结合 TasksStore 主动将最新任务列表推回 Prompt（免去 task_list），并提供哨兵文案供 Hook 识别冷却时间。
 """
+from rich.markup import escape
+
+from background_jobs import JobRegistry
 from tasks_store import TasksStore
+from ui.render import console
 
 from .file_state import ReadFileState
 
@@ -30,10 +34,7 @@ def build_file_reminder_text(state: ReadFileState) -> str | None:
         "以下文件在你读取之后被外部修改过，你 context 里的内容可能已过时，编辑前请重新用 read_file 读取：",
     ]
     lines += [f"- {path}" for path in stale]
-    body = "\n".join(lines)
-
-    # XML标签规范：用 <system-reminder> 标签包裹，便于模型区分系统指令与用户对话
-    return f"<system-reminder>\n{body}\n</system-reminder>"
+    return _wrap(lines)
 
 def build_task_reminder_text(store: TasksStore) -> str:
     """
@@ -52,3 +53,29 @@ def build_task_reminder_text(store: TasksStore) -> str:
         for t in tasks:
             lines.append(f"#{t.id}. [{t.status}] {t.subject}")
     return _wrap(lines)
+
+def build_job_reminder_text(registry: JobRegistry | None) -> str | None:
+    """
+    把「已结束但还没通知」的后台 job 拼成 <task-notification> 通知；没有新完成的就返回 None。
+    """
+    if registry is None:
+        return None
+    jobs = registry.pop_unnotified()
+    if not jobs:
+        return None
+    blocks = []
+    for job in jobs:
+        # 通知模型的同时，也给用户打一行完成提示
+        color = "green" if job.status == "completed" else "red"
+        console.print(f"[{color}]●[/] {escape(job.summary())}\n")
+        summary = f"{job.summary()}，可用 read_file 读输出文件"
+        blocks.append(
+            "<task-notification>\n"
+            f"<task-id>{job.id}</task-id>\n"
+            f"<task-type>{job.kind}</task-type>\n"
+            f"<output-file>{job.log_path}</output-file>\n"
+            f"<status>{job.status}</status>\n"
+            f"<summary>{summary}</summary>\n"
+            "</task-notification>"
+        )
+    return "\n\n".join(blocks)

@@ -1,13 +1,3 @@
-"""
-ui/input_ui.py - 终端常驻交互式输入组件 (REPL UI)
-
-职责：
-1. 界面常驻：将输入框固定在屏幕底部，配合 patch_stdout 让 Agent 的输出安全打印在输入框上方。
-2. 动画与状态指示：处理思考状态转圈动画 (Spinner)、已耗时计时，以及底部的权限模式提示。
-3. 键盘事件响应：绑定 Enter 提交、ESC/Ctrl+C 打断思考、Ctrl+D 退出、Shift+Tab 切换权限模式。
-4. 后台任务托管：将 Agent 执行包装为后台 Task，支持任务的实时 Cancel 强行打断。
-"""
-
 import asyncio
 import re
 import time
@@ -30,7 +20,7 @@ from rich.markup import escape
 
 import permissions
 from mentions import list_candidate_files
-from .render import console
+from .render import console, print_system_text
 
 # 常驻输入区：输入框整个会话期间挂在屏幕底部不消失，Agent 输出通过 patch_stdout 打印在它上方，请求期间按 ESC / Ctrl+C 能立刻打断。
 
@@ -69,6 +59,8 @@ class Repl:
         self.state = state
         # on_submit 由 main 注入，处理一行输入（命令或交给 Agent）
         self._on_submit = None
+        # on_system 也由 main 注入，处理系统触发的对话轮（如后台 job 完成通知）
+        self._on_system = None
         # 当前处理输入的后台任务，ESC / Ctrl+C 据此打断；None 表示空闲
         self._task = None
         # 是否正在请求模型，决定上方 working... 指示器的显隐
@@ -96,15 +88,22 @@ class Repl:
         return HTML("\n".join(rows))
 
     def _working_line(self):
-        # 输入框上方那行：转圈帧 + 已耗时 + 打断提示，只在请求期间显示
+        # 输入框上方那行：转圈帧 + 已耗时 + 打断提示，只在请求期间显示；有前台命令在跑时追加 ctrl+b 提示
         frame = _SPINNER[self._frame % len(_SPINNER)]
         elapsed = int(time.monotonic() - self._work_start)
-        return HTML(f"<ansigreen>{frame}</ansigreen> <b>Working…</b><ansibrightblack>（已耗时 {elapsed}s · 按 esc 打断）</ansibrightblack>")
+        hint = ""
+        if self.state.job_registry.running(background=False):
+            hint = " · ctrl+b 转后台"
+        return HTML(f"<ansigreen>{frame}</ansigreen> <b>Working…</b><ansibrightblack>（已耗时 {elapsed}s · 按 esc 打断{hint}）</ansibrightblack>")
 
     def _mode_line(self):
-        # 输入框下方那行：当前权限模式 + 切换提示
+        # 输入框下方那行：当前权限模式 + 切换提示，有后台 job 在跑时追加个数
         mode = permissions.state.mode
-        return HTML(f"  <ansimagenta><b>▶▶ {mode}</b></ansimagenta><ansibrightblack>（Shift+Tab 切换）</ansibrightblack>")
+        line = f"  <ansimagenta><b>▶▶ {mode}</b></ansimagenta><ansibrightblack>（Shift+Tab 切换）</ansibrightblack>"
+        running = len(self.state.job_registry.running(background=True))
+        if running:
+            line += f"<ansibrightblack> · </ansibrightblack><ansicyan>{running} shell</ansicyan>"
+        return HTML(line)
 
     def _divider(self):
         # 一条横向分割线
@@ -179,24 +178,6 @@ class Repl:
             else:
                 self._buffer.reset()
 
-        @kb.add("c-v")
-        def _(event):
-            try:
-                data = event.app.clipboard.get_data()
-                if getattr(data, "text", None):
-                    event.current_buffer.insert_text(data.text)
-            except Exception:
-                pass
-
-        @kb.add("s-insert")
-        def _(event):
-            try:
-                data = event.app.clipboard.get_data()
-                if getattr(data, "text", None):
-                    event.current_buffer.insert_text(data.text)
-            except Exception:
-                pass
-
         @kb.add("c-d")
         def _(event):
             # 空闲且输入为空时退出
@@ -207,6 +188,11 @@ class Repl:
         def _(event):
             # 循环切换权限模式
             permissions.cycle_mode()
+
+        @kb.add("c-b")
+        def _(event):
+            # 把正在前台跑的命令转入后台，工具调用会立即带着 job id 返回
+            self.state.job_registry.move_to_background()
 
         return kb
 
@@ -238,10 +224,11 @@ class Repl:
         console.print(f"[bright_black]{rule}[/]")
         console.print()
 
-    async def _process(self, text):
-        # 后台任务：交给 on_submit，统一兜住打断和异常
+    async def _process(self, text, handler=None):
+        # 后台任务：交给对应回调（默认是用户输入的 on_submit），统一兜住打断和异常
+        handler = handler or self._on_submit
         try:
-            await self._on_submit(text)
+            await handler(text)
         except asyncio.CancelledError:
             console.print("\n[bold yellow]已中断[/]\n")
         except Exception as e:
@@ -249,6 +236,11 @@ class Repl:
         finally:
             self._task = None
             self.working = False
+            # /rewind 回退对话后把原输入回填到输入框，用户改一改就能重发
+            if self.state.pending_input:
+                self._buffer.text = self.state.pending_input
+                self._buffer.cursor_position = len(self.state.pending_input)
+                self.state.pending_input = ""
             self.app.invalidate()
 
     def start_working(self):
@@ -257,13 +249,25 @@ class Repl:
         self._work_start = time.monotonic()
         self.app.invalidate()
 
+    @property
+    def is_idle(self):
+        return self._task is None
+
+    def submit_system(self, text) -> None:
+        """
+        提交一轮系统触发的对话（如后台 job 完成通知）；由调用方先确认 is_idle。
+        """
+        print_system_text(text)
+        self._task = self.app.create_background_task(self._process(text, self._on_system))
+
     def exit(self):
         # 结束常驻输入区（/exit 命令用）
         self.app.exit()
 
-    async def run(self, on_submit):
-        # 运行 REPL 直到用户退出；on_submit 是处理一行输入的异步回调
+    async def run(self, on_submit, on_system):
+        # 运行 REPL 直到用户退出；on_submit 处理用户输入，on_system 处理系统触发的对话轮
         self._on_submit = on_submit
+        self._on_system = on_system
         # 转圈动画的心跳：请求期间定时重绘
         ticker = asyncio.ensure_future(self._tick())
         try:

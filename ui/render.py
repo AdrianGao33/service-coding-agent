@@ -24,6 +24,13 @@ def print_step(label: str, content: str = "") -> None:
     console.print()
 
 
+def print_system_text(text: str) -> None:
+    """
+    以统一的 dim 样式回显一段系统注入的文本（reminder / job 通知）。
+    """
+    print_step("[dim]◇ system[/]", f"[dim]{text[:200]}[/]")
+
+
 def print_welcome_banner(title: str) -> None:
     """
     打印启动欢迎横幅：标题装在带色彩的 rich.Panel 里，附 /help 提示。

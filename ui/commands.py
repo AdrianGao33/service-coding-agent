@@ -21,6 +21,7 @@ import mcp_servers
 import permissions
 import session
 from agent import ReadFileState
+from background_jobs import JobRegistry
 from file_history import FileHistory
 from memory import background, store
 from tasks_store import TasksStore
@@ -62,6 +63,8 @@ class SessionState:
     surfaced_memories: set = field(default_factory=set)
     # 本会话的文件检查点，/rewind 靠它回退文件和对话；由 main 构造传入
     file_history: FileHistory | None = None
+    # 本会话的后台 job 注册表，注入给 shell 工具；由 main 构造传入
+    job_registry: JobRegistry | None = None
     # /rewind 回退对话后待回填输入框的原 prompt，Repl 在命令结束后消费
     pending_input: str = ""
     # 自动压缩连续失败的次数，达到上限后不再重试
@@ -248,6 +251,16 @@ def cmd_help(state: SessionState) -> bool:
     return True
 
 
+def _swap_job_registry(state: SessionState) -> JobRegistry:
+    """
+    终止旧会话还在跑的 job（它们是跟着会话走的真进程），换一份新注册表。
+    """
+    killed = state.job_registry.shutdown()
+    if killed:
+        console.print(f"[dim]已终止 {killed} 个还在运行的后台 job[/]")
+    return JobRegistry(session_id=state.session_id)
+
+
 def cmd_new(state: SessionState) -> bool:
     """
     开启新会话：清空历史、token 计数、API 调用记录，换一个新的会话 ID。
@@ -268,6 +281,8 @@ def cmd_new(state: SessionState) -> bool:
     state.surfaced_memories = set()
     # 文件检查点也按会话隔离，新会话从零开始记
     state.file_history = FileHistory(session_id=state.session_id)
+    # 后台 job 不跨会话：终止旧的，换新注册表
+    state.job_registry = _swap_job_registry(state)
     console.print("已开启新会话\n")
     return True
 
@@ -335,6 +350,8 @@ async def cmd_resume(state: SessionState) -> bool:
     state.surfaced_memories = set()
     # 文件检查点随会话恢复：构造函数会加载该会话落盘的 checkpoints.json，旧检查点直接可用
     state.file_history = FileHistory(session_id=state.session_id)
+    # 后台 job 不跨会话：终止旧的，恢复的会话从一份空注册表开始
+    state.job_registry = _swap_job_registry(state)
 
     # 把恢复的会话的 token 用量累加回来
     _recount_tokens(state)
@@ -607,15 +624,11 @@ def cmd_mcp(state: SessionState) -> bool:
         console.print(f"未配置任何 MCP server。可在项目根目录的 .mcp.json 或 {mcp_servers.USER_CONFIG} 中添加。\n")
         return True
     for record in mcp_servers.RECORDS:
-        server_id = getattr(record, "toolset_id", None) or getattr(getattr(record, "toolset", None), "id", "unknown")
-        console.print(f"[bold]{server_id}[/]  [dim]{escape(record.transport)}[/]")
+        console.print(f"[bold]{record.server.id}[/]  [dim]{escape(record.transport)}[/]")
         if record.status == "connected":
-            if record.tool_names:
-                console.print(f"  [green]已连接[/]，{len(record.tool_names)} 个工具")
-                for name in record.tool_names:
-                    console.print(f"    - {name}")
-            else:
-                console.print("  [green]已连接[/]，工具将在实际调用时按需加载")
+            console.print(f"  [green]已连接[/]，{len(record.tool_names)} 个工具")
+            for name in record.tool_names:
+                console.print(f"    - {name}")
         else:
             console.print(f"  [red]连接失败[/]：{escape(record.error)}")
         console.print()
@@ -685,12 +698,28 @@ def cmd_api_detail(state: SessionState) -> bool:
     return True
 
 
+def cmd_jobs(state: SessionState) -> bool:
+    """
+    列出本会话的后台 job 及其状态。
+    """
+    jobs = [job for job in state.job_registry.list() if job.background]
+    if not jobs:
+        console.print("(本会话还没有后台 job)\n")
+        return True
+    for job in jobs:
+        console.print(f"  {job.id} {escape(f'[{job.status}]')} {escape(job.description)}")
+        console.print(f"      日志：{job.log_path}")
+    console.print()
+    return True
+
+
 COMMANDS = {
     "new": Command("new", "开启新会话", cmd_new),
     "resume": Command("resume", "恢复历史会话", cmd_resume),
     "rewind": Command("rewind", "回退到之前的检查点", cmd_rewind),
     "compact": Command("compact", "压缩上下文（可带补充指令）", cmd_compact, takes_args=True),
     "status": Command("status", "显示当前会话状态", cmd_status),
+    "jobs": Command("jobs", "查看后台 job 列表", cmd_jobs),
     "mcp": Command("mcp", "查看 MCP server 状态和工具", cmd_mcp),
     "memory": Command("memory", "查看长期记忆", cmd_memory),
     "dream": Command("dream", "立即整理合并长期记忆", cmd_dream),

@@ -12,10 +12,9 @@ Agent 依赖聚合器 (AgentDeps)：基于依赖注入模式的状态聚合容�
 """
 from dataclasses import dataclass
 
+from background_jobs import JobRegistry
 from file_history import FileHistory
-
 from tasks_store import TasksStore
-
 from .file_state import ReadFileState
 
 
@@ -26,3 +25,5 @@ class AgentDeps:
     tasks_store: TasksStore | None
     # 文件检查点，写文件的工具用它备份改动前内容；默认 None，后台记忆 fork 写的记忆文件不进回退范围
     file_history: FileHistory | None = None
+    # 后台 job 注册表，shell 工具的后台模式和 job_kill 用；后台记忆 fork 不挂
+    job_registry: JobRegistry | None = None

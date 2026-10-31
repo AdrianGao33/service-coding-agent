@@ -9,6 +9,7 @@
 5. 引用文件预处理：@文件，预读，更新session的read_file_state
 """
 import asyncio # Python 标准异步库，支持 async/await 协程语法
+
 from pydantic_ai import Agent # End 是 PydanticAI 图状态机的终点节点。每个模型请求/工具调用都是一个 Node，遇到 End 循环终止
 from pydantic_graph import End
 
@@ -17,6 +18,8 @@ import mcp_servers
 import session
 from agent import agent, MODEL_NAME, api_call_log
 from agent.deps import AgentDeps
+from agent.reminders import build_job_reminder_text
+from background_jobs import JobRegistry
 from file_history import FileHistory
 from memory import background, recall, store
 from tasks_store import TasksStore
@@ -103,6 +106,7 @@ async def run_agent_loop(user_input, state):
         read_file_state=state.read_file_state,
         tasks_store=state.tasks_store,
         file_history=state.file_history,
+        job_registry=state.job_registry,
     )
  
     # 开启 Agent 图迭代器上下文，传入当前输入 + 全量历史上下文 (state.history) + mcp工具
@@ -139,6 +143,7 @@ async def main():
         session_id=session_id,
         tasks_store=tasks_store,
         file_history=FileHistory(session_id=session_id),
+        job_registry=JobRegistry(session_id=session_id),
     )
     print_welcome_banner("my-code-agent")
 
@@ -151,10 +156,16 @@ async def main():
     # 常驻输入区：输入框整个会话期间不消失
     repl = Repl(state)
 
+    # =========================================================================
+    # 1. 用户主动驱动轮：on_submit
+    # 【触发场景】用户在 REPL 终端按下回车键提交输入时触发。
+    # 【生命周期】按需触发（即点即跑），走完整的前置用户意图解析流程。
+    # =========================================================================
+
     async def on_submit(user_input):
         # 用户每次按下回车提交，均触发此函数
 
-        # 1. 优先拦截并处理斜杠命令
+        # 1. 拦截并处理斜杠命令（如 /exit, /clear）
         action = await handle_command(user_input, state)
         if action == "break":
             # 命令要求退出，结束常驻输入区
@@ -163,38 +174,77 @@ async def main():
         if action == "continue":
             return
 
-        # 发请求前检查上下文水位，越过阈值就先自动压缩再继续
+        # 2. 检查上下文水位，超限自动压缩
         await compact.auto_compact_if_needed(state)
 
-        # 建检查点：此刻 @ 引用和记忆召回还没注入，len(history) 就是干净的回退下标
+        # 3. 创建回退检查点：此刻 @ 引用和记忆召回还没注入，len(history) 就是干净的回退下标
         state.file_history.make_checkpoint(len(state.history), user_input)
 
-        # 解析 @ 引用，把被引用的文件伪装成 read_file 调用塞进历史
+        # 4. 解析 @ 引用，把被引用的文件伪装成 read_file 调用塞进历史
         inject_at_mentions(user_input, state)
 
         # 2. 切换 UI 为工作状态（显示思考中动画/指示器）
         repl.start_working()
 
-        # 召回相关记忆塞进历史，模型带着过去积累的经验处理本轮输入
+        # 4. 专属流程：召回长效记忆，让模型带着历史经验处理本轮输入
         await recall.inject_memories(user_input, state)
 
-        # 3. 驱动 Agent 图状态机开始思考与执行
+        # 5. 跑主循环 Agent 图
         result = await run_agent_loop(user_input, state)
 
-        # 本轮结束后由后台提炼记忆，并顺带检查是否到了该定期合并的时候
+        # 6. 本轮结束后由后台提炼记忆
         background.schedule(state, result.new_messages())
 
-    # 启动 Repl 事件循环，等待用户敲击回车唤起 on_submit
-    await repl.run(on_submit)
+    # =========================================================================
+    # 2. 系统后台驱动轮：on_system
+    # 【触发场景】由后台任务监控哨兵（watch_jobs）在空闲时检测到后台 Job 完成后自主触发。
+    # 【生命周期】异步事件驱动，无需用户干预，让 Agent 实现“自主向用户汇报”。
+    # =========================================================================
+    async def on_system(text):
+        # 系统触发的对话轮（后台 job 完成通知）：跳过检查点、@ 解析和记忆召回，直接跑 Agent
+        await compact.auto_compact_if_needed(state)
+        repl.start_working()
+        result = await run_agent_loop(text, state)
+        background.schedule(state, result.new_messages())
+
+    # =========================================================================
+    # 3. 后台轮询哨兵：watch_jobs
+    # 【触发场景】以常驻后台 Task 的形式存在，每隔 1 秒循环检查一次。
+    # 【核心职能】扮演“雷达”角色。如果 REPL 正处于空闲（is_idle），且后台有刚跑完的 Job，
+    #            就自动调用 `repl.submit_system(text)` 强行塞入系统汇报输入。
+    # =========================================================================
+    async def watch_jobs():
+        # 每隔一秒轮询查看一下repl，job 在 REPL 空闲时完成的话，把通知作为一轮系统输入提交，让模型自己开口汇报
+        try:
+            while True:
+                await asyncio.sleep(1)          # 每秒醒来一次，零 CPU 压力
+                if not repl.is_idle:
+                    continue
+                text = build_job_reminder_text(state.job_registry)
+                if text:
+                    repl.submit_system(text)    # 触发系统自主对话轮
+        except asyncio.CancelledError:
+            pass        # 优雅捕获退出取消信号
+
+    # 挂载后台哨兵 Task 到事件循环       
+    job_watcher = asyncio.ensure_future(watch_jobs())
+    try:
+        await repl.run(on_submit, on_system) # 进入 REPL 主交互死循环（接管前后端输入与系统汇报）
+    finally:
+        # 安全网：无论正常退出还是异常报错，必须注销后台哨兵任务，防止产生孤儿协程
+        job_watcher.cancel()
 
     # 退出前给后台记忆任务留收尾时间，提炼写到一半被杀会留下半截记忆
     await background.drain()
-
-    # todo
-    await mcp_servers.shutdown()
+    # 后台 job 是真进程，不等待、直接终止，不让它们活过本次会话
+    killed = state.job_registry.shutdown()
+    if killed:
+        console.print(f"[dim]退出时终止了 {killed} 个还在运行的后台 job[/]")
+    await mcp_servers.shutdown()    # 关闭 MCP 服务连接管道
 
 if __name__ == "__main__":
     try:
+        # 贯通全局的事件循环开启
         asyncio.run(main())
     except (KeyboardInterrupt, EOFError):
         pass # 优雅响应 Ctrl+C 或 Ctrl+D 退出

@@ -13,17 +13,15 @@ import dataclasses
 from dataclasses import dataclass, field
 from typing import Any
 
-# 从 pydantic_ai 中导入生命周期 Hook 管理类[cite: 3]
 from pydantic_ai.capabilities import Hooks
 from pydantic_ai.exceptions import ModelHTTPError, ModelAPIError
 from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, UserPromptPart
 
 import classifier
 import permissions
-from ui.render import console, print_step
+from ui.render import console, print_step, print_system_text
 
-from .deps import AgentDeps
-from .reminders import build_file_reminder_text, build_task_reminder_text
+from .reminders import build_job_reminder_text, build_file_reminder_text, build_task_reminder_text
 
 MAX_RETRIES = 3
 
@@ -159,22 +157,23 @@ def _build_task_reminder(ctx, messages) -> str | None:
         return None
     return build_task_reminder_text(ctx.deps.tasks_store)
 
+def _build_job_reminder(ctx, messages) -> str | None:
+    # turn 进行中完成的后台 job，在下一次 model 请求前顺路通知
+    return build_job_reminder_text(ctx.deps.job_registry)
 
 # 注册要在 before_model_request 触发的 reminder builder：每条 (sentinel, builder)，sentinel 仅用于回扫识别（task reminder 复用）
 _REMINDER_SENTINELS = {
     # task reminder 的识别串就是它正文里 builder 必定带的那句话，不再单独嵌一个 marker
     "task": "task 工具最近没有被使用",
 }
-_REMINDER_BUILDERS = (_build_file_reminder, _build_task_reminder)
+_REMINDER_BUILDERS = (_build_file_reminder, _build_task_reminder, _build_job_reminder)
 
 
 @hooks.on.before_model_request
 async def _inject_reminders(ctx, request_context):
     """
-    合并触发提醒
     依次跑每个注册过的 reminder builder：返回非 None 的就拼到 request_context.messages 末尾。
-    当前两条：过期文件提醒（看 readFileState）+ task 提醒（看 turn 计数 + tasks_store）。
-    要加第 3 种 reminder 时只需多写一个 builder，不必再复制一次 hook 框架。
+    当前三条：过期文件提醒（看 readFileState）+ task 提醒（看 turn 计数 + tasks_store）+ 后台 job 完成通知（看 job_registry）。要再加新 reminder 时只需多写一个 builder，不必再复制一次 hook 框架。
     """
     messages = list(request_context.messages)
     appended = []
@@ -183,7 +182,7 @@ async def _inject_reminders(ctx, request_context):
         if text is None:
             continue
         appended.append(ModelRequest(parts=[UserPromptPart(content=text)]))
-        print_step("[dim]◇ system[/]", f"[dim]{text[:200]}[/]")
+        print_system_text(text)
     # 如果没有任何提醒需要追加，原封不动放行
     if not appended:
         return request_context

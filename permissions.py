@@ -32,10 +32,11 @@ BYPASS = "bypass"
 # 权限模式按 Shift+Tab 切换模式
 MODES = [DEFAULT, ACCEPT_EDITS, AUTO, BYPASS]
 
-# 只读工具表：无破坏力，任何模式下都直接放行
-# ask_user_question 工具本身就是问用户，再过审批就套娃，和 read_file 同等放行
+# 只读工具，任何模式都自动放行（读取不会改动系统，放行没风险）
 # task_* 工具只触碰 ~/.my-code-agent/tasks/ 下的私有数据目录，不影响用户工程目录和系统状态，按只读工具放行不弹审批
-READONLY_TOOLS = {"read_file", "ask_user_question", "task_create", "task_list", "task_get", "task_update"}
+# ask_user_question 工具本身就是问用户，再过审批就套娃，和 read_file 同等放行
+# job_kill 只终止 agent 自己启动的后台 job，起进程那一步已经审批过，终止是降级操作，直接放行
+READONLY_TOOLS = {"read_file", "ask_user_question", "task_create", "task_list", "task_get", "task_update", "job_kill"}
 # 编辑文件类工具表，acceptEdits 模式下自动放行
 EDIT_TOOLS = {"write_file", "edit_file"}
 

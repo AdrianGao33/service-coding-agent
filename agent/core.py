@@ -43,6 +43,8 @@ INSTRUCTIONS = (
     "改动局部内容时优先用 edit_file（只传改动的片段，省 token），新建文件或整体重写才用 write_file。\n"
     "工作流程：先理解需求，写代码，然后运行验证。"
     "如果有错误就修复并重新运行，直到确认正确。\n"
+    "长驻或耗时命令（dev server、长测试）用 run_command 的 run_in_background=True 放到后台执行——只在不需要立刻拿到结果时使用，命令末尾不需要加 &。"
+    "后台 job 结束后你会收到 <task-notification> 通知，所以不要主动轮询等待；期间可以用 read_file 读它的日志文件查看已有输出，也可以用 job_kill 提前终止。\n"
     "当你接到一个需要 3 步以上、或需要多次工具调用才能完成的任务时，"
     "先用 task_create 把分解出来的步骤建成 pending task，开工前用 task_update 把要做的那条切到 in_progress，做完立刻切 completed。"
     "如果是琐碎请求（1-2 步、纯对话、纯查询），不要建 task，建了反而碍事。做完的 task 不要让它一直挂在 in_progress。\n"

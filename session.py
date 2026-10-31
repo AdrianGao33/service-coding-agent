@@ -105,7 +105,7 @@ def load_history(session_id: str) -> list:
 def first_prompt(path: Path) -> str:
     """
     从文件开头找到首条真正的用户输入，作为这个会话的摘要。
-    召回的记忆、@ 引用可能排在它前面，所以要跳过 system-reminder 内容，必要时多读几行。
+    召回的记忆、@ 引用、job 通知可能排在它前面，所以要跳过 system-reminder / task-notification 内容，必要时多读几行。
     """
     with open(path, encoding="utf-8") as f:
         for _ in range(20):
@@ -117,7 +117,7 @@ def first_prompt(path: Path) -> str:
                 if part.get("part_kind") != "user-prompt":
                     continue
                 content = str(part.get("content", ""))
-                if content.startswith("<system-reminder>"):
+                if content.startswith(("<system-reminder>", "<task-notification>")):
                     continue
                 return content
     return "(空会话)"
